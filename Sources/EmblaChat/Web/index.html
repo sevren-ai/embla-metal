@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embla</title>
+<style>
+/* sevren.ai's palette */
+:root {
+  --bg: #FAF9F6; --panel: #FFFFFF; --text: #14151A; --muted: #5A6273; --line: #E6E4DD;
+  --accent: #E8B14C; --accent-text: #241A06; --link: #A9711A; --user: rgba(232, 177, 76, 0.16);
+  --code: #F4F2EC; --danger: #C0442E;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #08090C; --panel: #0C0E13; --text: #EEF1F8; --muted: #8890A6; --line: #1B1F2A;
+    --accent: #E8B14C; --accent-text: #241A06; --link: #E8B14C; --user: rgba(232, 177, 76, 0.13);
+    --code: #11141B; --danger: #E5604B;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  display: flex; flex-direction: column;
+}
+header {
+  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+header .model { color: var(--muted); font-size: 13px; }
+header .spacer { flex: 1; }
+button {
+  font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer;
+}
+button:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+#settings {
+  display: none; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  gap: 12px 20px; flex-wrap: wrap; align-items: end;
+}
+#settings.open { display: flex; }
+#settings label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+#settings input, #settings textarea {
+  font: inherit; font-size: 14px; color: var(--text); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+}
+#settings input { width: 90px; }
+#settings textarea { width: min(520px, 90vw); height: 54px; resize: vertical; }
+main { flex: 1; overflow-y: auto; }
+#log { max-width: 780px; margin: 0 auto; padding: 24px 16px 8px; }
+.empty { color: var(--muted); text-align: center; margin-top: 18vh; }
+.empty h2 { color: var(--text); font-weight: 600; font-size: 22px; margin: 0 0 6px; }
+.msg { margin: 0 0 22px; }
+.msg.user { display: flex; justify-content: flex-end; }
+.msg.user .bubble {
+  background: var(--user); padding: 9px 14px; border-radius: 14px; max-width: 85%;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.msg.assistant .body { overflow-wrap: anywhere; }
+.body p { margin: 0 0 10px; }
+.body p:last-child { margin-bottom: 0; }
+.body pre {
+  background: var(--code); border-radius: 8px; padding: 10px 12px; overflow-x: auto;
+  font: 13px/1.45 ui-monospace, "SF Mono", Menlo, monospace; margin: 0 0 10px;
+}
+.body code { font: 13px ui-monospace, "SF Mono", Menlo, monospace; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+.body pre code { background: none; padding: 0; }
+.body ul, .body ol { margin: 0 0 10px; padding-left: 22px; }
+.body h1, .body h2, .body h3, .body h4 { font-size: 15px; margin: 14px 0 6px; }
+.body a { color: var(--link); }
+details.think { margin: 0 0 10px; color: var(--muted); font-size: 13.5px; }
+details.think summary { cursor: pointer; user-select: none; list-style: none; }
+details.think summary::before { content: "▸ "; }
+details.think[open] summary::before { content: "▾ "; }
+details.think .thought {
+  white-space: pre-wrap; border-left: 2px solid var(--line); padding: 4px 0 4px 12px; margin-top: 6px;
+  max-height: 340px; overflow-y: auto;
+}
+.stats { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.error { color: var(--danger); }
+.cursor::after { content: "▍"; animation: blink 1s steps(2) infinite; color: var(--muted); }
+@keyframes blink { 50% { opacity: 0; } }
+footer { padding: 10px 16px 16px; }
+#composer {
+  max-width: 780px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 8px;
+}
+#input {
+  flex: 1; border: 0; outline: 0; resize: none; background: transparent; color: var(--text);
+  font: inherit; max-height: 220px; padding: 6px 6px;
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Embla</h1>
+  <span class="model" id="model"></span>
+  <span class="spacer"></span>
+  <button id="settingsBtn" type="button">Settings</button>
+  <button id="newBtn" type="button">New chat</button>
+</header>
+<div id="settings">
+  <label>System prompt<textarea id="system" placeholder="Optional"></textarea></label>
+  <label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.05" value="0.6"></label>
+  <label>Top-p<input id="top_p" type="number" min="0" max="1" step="0.01" value="0.95"></label>
+  <label>Max tokens<input id="max_tokens" type="number" min="1" step="1" placeholder="no limit"></label>
+</div>
+<main id="scroller"><div id="log"></div></main>
+<footer>
+  <form id="composer">
+    <textarea id="input" rows="1" placeholder="Message Embla" autofocus></textarea>
+    <button id="send" class="primary" type="submit">Send</button>
+  </form>
+</footer>
+<script>
+const $ = (id) => document.getElementById(id);
+const log = $("log"), input = $("input"), sendBtn = $("send"), scroller = $("scroller");
+let history = [];      // {role, content}
+let controller = null; // the running request
+
+const store = {
+  get(k) { try { return localStorage.getItem("embla." + k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem("embla." + k, v); } catch {} },
+};
+for (const k of ["system", "temperature", "top_p", "max_tokens"]) {
+  const v = store.get(k);
+  if (v !== null) $(k).value = v;
+  $(k).addEventListener("change", () => store.set(k, $(k).value));
+}
+
+fetch("/v1/models").then(r => r.json()).then(d => {
+  const m = d.data && d.data[0];
+  if (m) $("model").textContent = m.id + " · " + m.context_length.toLocaleString() + " tokens";
+}).catch(() => {});
+
+function showEmpty() {
+  log.innerHTML = '<div class="empty"><h2>Embla 1</h2>Running locally on this Mac\'s GPU.</div>';
+}
+showEmpty();
+
+$("settingsBtn").onclick = () => $("settings").classList.toggle("open");
+$("newBtn").onclick = () => { if (controller) controller.abort(); history = []; showEmpty(); input.focus(); };
+
+input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = input.scrollHeight + "px"; });
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("composer").requestSubmit(); }
+});
+
+function nearBottom() { return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80; }
+function toBottom() { scroller.scrollTop = scroller.scrollHeight; }
+
+// A small Markdown renderer: code fences, inline code, bold, italics, headings, lists, links.
+function escapeHTML(s) { return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+function inline(s) {
+  const codes = [];
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => { codes.push(c); return "\u0000" + (codes.length - 1) + "\u0000"; });
+  s = escapeHTML(s)
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + escapeHTML(codes[+i]) + "</code>");
+}
+function markdown(src) {
+  const out = [], lines = src.split("\n");
+  let para = [], list = null;
+  const flushPara = () => { if (para.length) { out.push("<p>" + para.map(inline).join("<br>") + "</p>"); para = []; } };
+  const flushList = () => { if (list) { out.push("<" + list.tag + ">" + list.items.map(i => "<li>" + inline(i) + "</li>").join("") + "</" + list.tag + ">"); list = null; } };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const fence = line.match(/^\s*```(\S*)/);
+    if (fence) {
+      flushPara(); flushList();
+      const code = [];
+      for (i++; i < lines.length && !/^\s*```/.test(lines[i]); i++) code.push(lines[i]);
+      out.push("<pre><code>" + escapeHTML(code.join("\n")) + "</code></pre>");
+      continue;
+    }
+    const h = line.match(/^(#{1,4})\s+(.*)/);
+    const li = line.match(/^\s*(?:([-*+])|(\d+)[.)])\s+(.*)/);
+    if (h) { flushPara(); flushList(); out.push("<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"); }
+    else if (li) {
+      flushPara();
+      const tag = li[1] ? "ul" : "ol";
+      if (!list || list.tag !== tag) { flushList(); list = { tag, items: [] }; }
+      list.items.push(li[3]);
+    }
+    else if (!line.trim()) { flushPara(); flushList(); }
+    else { flushList(); para.push(line); }
+  }
+  flushPara(); flushList();
+  return out.join("");
+}
+
+function addUser(text) {
+  if (log.querySelector(".empty")) log.innerHTML = "";
+  const m = document.createElement("div");
+  m.className = "msg user";
+  m.innerHTML = '<div class="bubble"></div>';
+  m.firstChild.textContent = text;
+  log.appendChild(m);
+}
+
+function addAssistant() {
+  const m = document.createElement("div");
+  m.className = "msg assistant";
+  m.innerHTML = '<details class="think" open hidden><summary>Thinking…</summary><div class="thought"></div></details><div class="body cursor"></div><div class="stats"></div>';
+  log.appendChild(m);
+  return { think: m.querySelector(".think"), thought: m.querySelector(".thought"), body: m.querySelector(".body"),
+           stats: m.querySelector(".stats"), summary: m.querySelector("summary") };
+}
+
+function setBusy(busy) {
+  sendBtn.textContent = busy ? "Stop" : "Send";
+  sendBtn.classList.toggle("primary", !busy);
+}
+
+$("composer").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (controller) { controller.abort(); return; }
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = ""; input.style.height = "auto";
+  addUser(text);
+  const convo = history;   // "New chat" starts another; this reply stays with its own
+  convo.push({ role: "user", content: text });
+  const view = addAssistant();
+  toBottom();
+
+  const messages = [];
+  if ($("system").value.trim()) messages.push({ role: "system", content: $("system").value.trim() });
+  messages.push(...convo);
+  const body = { messages, stream: true, temperature: parseFloat($("temperature").value), top_p: parseFloat($("top_p").value) };
+  const maxTokens = parseInt($("max_tokens").value, 10);
+  if (maxTokens > 0) body.max_tokens = maxTokens;
+
+  controller = new AbortController();
+  setBusy(true);
+  let reasoning = "", content = "", timings = null, finish = null;
+  const started = performance.now();
+  let thinkEnded = null;
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: controller.signal,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error((err.error && err.error.message) || res.statusText);
+    }
+    const reader = res.body.getReader(), decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf("\n\n")) >= 0) {
+        const event = buf.slice(0, cut); buf = buf.slice(cut + 2);
+        if (!event.startsWith("data: ") || event === "data: [DONE]") continue;
+        const d = JSON.parse(event.slice(6));
+        if (d.timings) timings = d.timings;
+        const c = d.choices && d.choices[0];
+        if (!c) continue;
+        if (c.finish_reason) finish = c.finish_reason;
+        const stick = nearBottom();
+        if (c.delta && c.delta.reasoning_content) {
+          reasoning += c.delta.reasoning_content;
+          view.think.hidden = false;
+          view.thought.textContent = reasoning;
+          view.thought.scrollTop = view.thought.scrollHeight;
+        }
+        if (c.delta && c.delta.content) {
+          if (thinkEnded === null) {
+            thinkEnded = performance.now();
+            view.think.open = false;
+            view.summary.textContent = "Thought for " + ((thinkEnded - started) / 1000).toFixed(1) + " s";
+          }
+          content += c.delta.content;
+          view.body.innerHTML = markdown(content);
+        }
+        if (stick) toBottom();
+      }
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      view.body.insertAdjacentHTML("beforeend", '<p class="error">' + escapeHTML(String(err.message || err)) + "</p>");
+    } else {
+      finish = "stopped";
+    }
+  }
+  view.body.classList.remove("cursor");
+  if (thinkEnded === null && reasoning) {
+    view.summary.textContent = "Thought for " + ((performance.now() - started) / 1000).toFixed(1) + " s";
+  }
+  const parts = [];
+  if (timings && timings.predicted_n > 1) {
+    parts.push((((timings.predicted_n - 1) / timings.predicted_ms) * 1000).toFixed(0) + " tok/s");
+    parts.push(timings.predicted_n + " tokens");
+    parts.push("prompt " + timings.prompt_n + " tokens in " + timings.prompt_ms.toFixed(0) + " ms");
+  }
+  if (finish === "length") parts.push("hit the token limit");
+  if (finish === "stopped") parts.push("stopped");
+  view.stats.textContent = parts.join(" · ");
+  convo.push({ role: "assistant", content });
+  controller = null;
+  setBusy(false);
+  input.focus();
+});
+</script>
+</body>
+</html>
