@@ -22,6 +22,15 @@ final class ChatTests: XCTestCase {
         XCTAssertThrowsError(try ChatTemplate.render([]))
     }
 
+    /// OpenAI content parts are concatenated with nothing between them, like the jinja's render_content.
+    func testContentParts() throws {
+        XCTAssertEqual(try Server.text("plain"), "plain")
+        XCTAssertEqual(try Server.text(nil), "")
+        XCTAssertEqual(try Server.text([["type": "text", "text": "Always answer "], ["type": "text", "text": "in Danish."]]),
+                       "Always answer in Danish.")
+        XCTAssertThrowsError(try Server.text([["type": "image_url", "image_url": ["url": "x"]]]))
+    }
+
     /// Multi-byte characters split across tokens come out whole.
     func testTextStream() {
         var s = TextStream()
