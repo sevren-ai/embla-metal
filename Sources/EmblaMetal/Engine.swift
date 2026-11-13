@@ -962,14 +962,13 @@ public final class Engine: @unchecked Sendable {
         let pf = prefiller, T = Prefill.chunk
         prefillGPU = 0
         prefillRead = 0
-        let id = { (q: Int) -> UInt64 in self.knownToken(q) }
-        let e = pf.e.contents().assumingMemoryBound(to: UInt16.self)
+        nonisolated(unsafe) let e = pf.e.contents().assumingMemoryBound(to: UInt16.self)
         // the engram rows of positions p0 ..< p1 into half k of e
         func read(_ p0: Int, _ k: Int, _ p1: Int) {
             let r0 = Date()
             DispatchQueue.concurrentPerform(iterations: p1 - p0) { j in
                 let q = p0 + j
-                self.table.read(rows: self.table.rows([id(q - 2), id(q - 1), id(q)]), into: e + (k * T + j) * Embla.d)
+                self.table.read(rows: self.table.rows([self.knownToken(q - 2), self.knownToken(q - 1), self.knownToken(q)]), into: e + (k * T + j) * Embla.d)
             }
             prefillRead += Date().timeIntervalSince(r0)
         }
