@@ -28,7 +28,6 @@ body {
 pre, code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
 header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
 header h1 { font-size: 16px; font-weight: 600; margin: 0; }
-header .model { color: var(--muted); font-size: 12px; }
 header .spacer { flex: 1; }
 header .dev { color: var(--muted); font-size: 11px; }
 /* The Embla figure with the brand's edge glow, scaled to its size */
@@ -108,7 +107,6 @@ footer { padding: 10px 16px 16px; }
     <g transform="rotate(11 16.6 19.2) translate(0 -0.8)"><rect x="15.4" y="7.2" width="4.4" height="12.8" rx="2.2" fill="#E8B14C"/></g>
   </svg>
   <h1>Embla</h1>
-  <span class="model mono" id="model"></span>
   <span class="spacer"></span>
   <span class="dev mono">embla-metal · dev</span>
   <button id="settingsBtn" type="button">Settings</button>
@@ -142,11 +140,6 @@ for (const k of ["system", "temperature", "top_p", "max_tokens"]) {
   if (v !== null) $(k).value = v;
   $(k).addEventListener("change", () => store.set(k, $(k).value));
 }
-
-fetch("/v1/models").then(r => r.json()).then(d => {
-  const m = d.data && d.data[0];
-  if (m) $("model").textContent = m.id + " · ctx " + m.context_length.toLocaleString();
-}).catch(() => {});
 
 function newChat() {
   if (controller) controller.abort();
