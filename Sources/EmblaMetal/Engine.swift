@@ -1148,13 +1148,22 @@ public final class Engine: @unchecked Sendable {
         var genStart = Date()
         var stoppedAt: Int?
         for p in P - 1 ..< steps {
+            // The first new token's second half waits for engram rows the CPU can read only once
+            // the prompt's last step is done, behind the whole batched prefill (tens of seconds at
+            // 14k+ tokens on an M2). Committed that early, it sits on the GPU waiting that long and
+            // macOS kills it (kIOGPUCommandBufferCallbackErrorTimeout), then ignores every later
+            // command buffer: zero tokens, then a dead queue. So it is committed once the prompt's
+            // token is known, still before the GPU gets to it (it runs the first half meanwhile).
+            var held: MTLCommandBuffer?
             if p + 1 < steps {
                 let c = encodeStep(pos: p + 1)
-                c.0.commit(); c.1.commit()
+                c.0.commit()
+                if p == P - 1 && !prefilling.isEmpty { held = c.1 } else { c.1.commit() }
                 submitted.append(c)
             }
             let w0 = DispatchTime.now().uptimeNanoseconds
             if !noWait { known.append(awaitStep(p, submitted[p - first].1)) } else { known.append(0) }
+            held?.commit()
             if p == P - 1 {
                 mark("first token")
                 if trace {
