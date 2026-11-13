@@ -163,7 +163,7 @@ public final class Server: @unchecked Sendable {
                 "model": name, "choices": [choice]]
     }
 
-    /// A message's content: a string, or OpenAI's parts (text only).
+    /// A message's content: a string, or OpenAI's parts (text only), concatenated as chat_template.jinja does.
     static func text(_ content: Any?) throws -> String {
         if let s = content as? String { return s }
         if content == nil || content is NSNull { return "" }
@@ -173,7 +173,7 @@ public final class Server: @unchecked Sendable {
                 throw ChatError.badRequest("only text content is supported")
             }
             return t
-        }.joined(separator: "\n")
+        }.joined()
     }
 
     func log(_ s: String) {

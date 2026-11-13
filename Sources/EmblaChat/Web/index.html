@@ -3,9 +3,10 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Embla</title>
+<title>Embla · embla-metal dev</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='3 3 18 18'%3E%3Crect x='4.6' y='4' width='9.4' height='16' rx='3.6' fill='%23E8B14C'/%3E%3Cellipse cx='8.0' cy='9.4' rx='1.0' ry='1.3' fill='%23241A06'/%3E%3Cellipse cx='10.8' cy='9.4' rx='1.0' ry='1.3' fill='%23241A06'/%3E%3Cg transform='rotate(11 16.6 19.2) translate(0 -0.8)'%3E%3Crect x='15.4' y='7.2' width='4.4' height='12.8' rx='2.2' fill='%23E8B14C'/%3E%3C/g%3E%3C/svg%3E">
 <style>
-/* sevren.ai's palette */
+/* The chat page of `embla serve`: a light page for trying the model, not a product. */
 :root {
   --bg: #FAF9F6; --panel: #FFFFFF; --text: #14151A; --muted: #5A6273; --line: #E6E4DD;
   --accent: #E8B14C; --accent-text: #241A06; --link: #A9711A; --user: rgba(232, 177, 76, 0.16);
@@ -14,8 +15,7 @@
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #08090C; --panel: #0C0E13; --text: #EEF1F8; --muted: #8890A6; --line: #1B1F2A;
-    --accent: #E8B14C; --accent-text: #241A06; --link: #E8B14C; --user: rgba(232, 177, 76, 0.13);
-    --code: #11141B; --danger: #E5604B;
+    --link: #E8B14C; --user: rgba(232, 177, 76, 0.13); --code: #11141B; --danger: #E5604B;
   }
 }
 * { box-sizing: border-box; }
@@ -25,65 +25,68 @@ body {
   font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
   display: flex; flex-direction: column;
 }
-header {
-  display: flex; align-items: center; gap: 12px; padding: 10px 16px;
-  border-bottom: 1px solid var(--line); background: var(--panel);
-}
-header h1 { font-size: 16px; margin: 0; font-weight: 600; }
-header .model { color: var(--muted); font-size: 13px; }
+pre, code, .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+header { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { font-size: 16px; font-weight: 600; margin: 0; }
 header .spacer { flex: 1; }
+header .dev { color: var(--muted); font-size: 11px; }
+/* The Embla figure with the brand's edge glow, scaled to its size */
+.mark { flex: none; overflow: visible; }
+header .mark { width: 24px; height: 24px; filter: drop-shadow(0 0 1px #E8B14Cee) drop-shadow(0 0 3px #E8B14Caa) drop-shadow(0 0 7px #E8B14C66); }
 button {
   font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--text);
   border-radius: 8px; padding: 6px 12px; cursor: pointer;
 }
 button:hover { border-color: var(--muted); }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+#settingsBtn.on::after { content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 6px; border-radius: 50%; background: var(--accent); vertical-align: middle; }
 #settings {
   display: none; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
-  gap: 12px 20px; flex-wrap: wrap; align-items: end;
+  gap: 12px 20px; flex-wrap: wrap; align-items: start;
 }
 #settings.open { display: flex; }
 #settings label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+#settings label.system { flex: 1; min-width: 240px; max-width: 560px; }
 #settings input, #settings textarea {
   font: inherit; font-size: 14px; color: var(--text); background: var(--bg);
   border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
 }
 #settings input { width: 90px; }
-#settings textarea { width: min(520px, 90vw); height: 54px; resize: vertical; }
+#system { width: 100%; height: 54px; resize: vertical; }
 main { flex: 1; overflow-y: auto; }
 #log { max-width: 780px; margin: 0 auto; padding: 24px 16px 8px; }
-.empty { color: var(--muted); text-align: center; margin-top: 18vh; }
-.empty h2 { color: var(--text); font-weight: 600; font-size: 22px; margin: 0 0 6px; }
-.msg { margin: 0 0 22px; }
+.empty { color: var(--muted); text-align: center; margin-top: 16vh; font-size: 14px; }
+.empty .mark { width: 72px; height: 72px; margin-bottom: 14px;
+  filter: drop-shadow(0 0 3px #E8B14Cee) drop-shadow(0 0 12px #E8B14Caa) drop-shadow(0 0 28px #E8B14C66); }
+.empty h2 { color: var(--text); font-weight: 600; font-size: 20px; margin: 0 0 4px; }
+.msg { margin: 0 0 20px; }
 .msg.user { display: flex; justify-content: flex-end; }
-.msg.user .bubble {
+.msg.user .text {
   background: var(--user); padding: 9px 14px; border-radius: 14px; max-width: 85%;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
-.msg.assistant .body { overflow-wrap: anywhere; }
+/* The system prompt is its own turn: a quiet note, never a user bubble */
+.msg.system { color: var(--muted); font-size: 13px; border-left: 2px solid var(--accent); padding: 2px 0 2px 10px; }
+.msg.system .label { font-weight: 600; margin-right: 6px; }
+.msg.system .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.body { overflow-wrap: anywhere; }
 .body p { margin: 0 0 10px; }
 .body p:last-child { margin-bottom: 0; }
-.body pre {
-  background: var(--code); border-radius: 8px; padding: 10px 12px; overflow-x: auto;
-  font: 13px/1.45 ui-monospace, "SF Mono", Menlo, monospace; margin: 0 0 10px;
-}
-.body code { font: 13px ui-monospace, "SF Mono", Menlo, monospace; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+.body pre { background: var(--code); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font-size: 13px; line-height: 1.45; margin: 0 0 10px; }
+.body code { font-size: 13px; background: var(--code); padding: 1px 4px; border-radius: 4px; }
 .body pre code { background: none; padding: 0; }
 .body ul, .body ol { margin: 0 0 10px; padding-left: 22px; }
 .body h1, .body h2, .body h3, .body h4 { font-size: 15px; margin: 14px 0 6px; }
 .body a { color: var(--link); }
-details.think { margin: 0 0 10px; color: var(--muted); font-size: 13.5px; }
-details.think summary { cursor: pointer; user-select: none; list-style: none; }
-details.think summary::before { content: "▸ "; }
-details.think[open] summary::before { content: "▾ "; }
+details.think { margin: 0 0 8px; color: var(--muted); font-size: 13.5px; }
+details.think summary { cursor: pointer; user-select: none; }
 details.think .thought {
   white-space: pre-wrap; border-left: 2px solid var(--line); padding: 4px 0 4px 12px; margin-top: 6px;
-  max-height: 340px; overflow-y: auto;
+  max-height: 320px; overflow-y: auto;
 }
 .stats { color: var(--muted); font-size: 12px; margin-top: 6px; }
 .error { color: var(--danger); }
-.cursor::after { content: "▍"; animation: blink 1s steps(2) infinite; color: var(--muted); }
-@keyframes blink { 50% { opacity: 0; } }
+.cursor::after { content: "▍"; color: var(--muted); }
 footer { padding: 10px 16px 16px; }
 #composer {
   max-width: 780px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end;
@@ -91,23 +94,29 @@ footer { padding: 10px 16px 16px; }
 }
 #input {
   flex: 1; border: 0; outline: 0; resize: none; background: transparent; color: var(--text);
-  font: inherit; max-height: 220px; padding: 6px 6px;
+  font: inherit; max-height: 220px; padding: 6px;
 }
 </style>
 </head>
 <body>
 <header>
+  <svg class="mark" viewBox="3 3 18 18" aria-hidden="true">
+    <rect x="4.6" y="4" width="9.4" height="16" rx="3.6" fill="#E8B14C"/>
+    <ellipse cx="8.0" cy="9.4" rx="1.0" ry="1.3" fill="#241A06"/><ellipse cx="10.8" cy="9.4" rx="1.0" ry="1.3" fill="#241A06"/>
+    <circle cx="8.3" cy="8.95" r="0.32" fill="#FFF3D6"/><circle cx="11.1" cy="8.95" r="0.32" fill="#FFF3D6"/>
+    <g transform="rotate(11 16.6 19.2) translate(0 -0.8)"><rect x="15.4" y="7.2" width="4.4" height="12.8" rx="2.2" fill="#E8B14C"/></g>
+  </svg>
   <h1>Embla</h1>
-  <span class="model" id="model"></span>
   <span class="spacer"></span>
+  <span class="dev mono">embla-metal · dev</span>
   <button id="settingsBtn" type="button">Settings</button>
   <button id="newBtn" type="button">New chat</button>
 </header>
 <div id="settings">
-  <label>System prompt<textarea id="system" placeholder="Optional"></textarea></label>
+  <label class="system">System prompt (used from the next new chat)<textarea id="system" placeholder="None"></textarea></label>
   <label>Temperature<input id="temperature" type="number" min="0" max="2" step="0.05" value="0.6"></label>
   <label>Top-p<input id="top_p" type="number" min="0" max="1" step="0.01" value="0.95"></label>
-  <label>Max tokens<input id="max_tokens" type="number" min="1" step="1" placeholder="no limit"></label>
+  <label>Max tokens<input id="max_tokens" type="number" min="1" step="1" placeholder="No limit"></label>
 </div>
 <main id="scroller"><div id="log"></div></main>
 <footer>
@@ -119,7 +128,7 @@ footer { padding: 10px 16px 16px; }
 <script>
 const $ = (id) => document.getElementById(id);
 const log = $("log"), input = $("input"), sendBtn = $("send"), scroller = $("scroller");
-let history = [];      // {role, content}
+let history = [];      // the chat's messages, {role, content}; a system message, if any, comes first
 let controller = null; // the running request
 
 const store = {
@@ -132,18 +141,20 @@ for (const k of ["system", "temperature", "top_p", "max_tokens"]) {
   $(k).addEventListener("change", () => store.set(k, $(k).value));
 }
 
-fetch("/v1/models").then(r => r.json()).then(d => {
-  const m = d.data && d.data[0];
-  if (m) $("model").textContent = m.id + " · " + m.context_length.toLocaleString() + " tokens";
-}).catch(() => {});
-
-function showEmpty() {
-  log.innerHTML = '<div class="empty"><h2>Embla 1</h2>Running locally on this Mac\'s GPU.</div>';
+function newChat() {
+  if (controller) controller.abort();
+  history = [];
+  log.innerHTML = '<div class="empty">' + document.querySelector("header .mark").outerHTML
+    + '<h2>Embla 1</h2>Running on this Mac with embla-metal.</div>';
+  input.focus();
 }
-showEmpty();
-
+newChat();
+$("newBtn").onclick = newChat;
 $("settingsBtn").onclick = () => $("settings").classList.toggle("open");
-$("newBtn").onclick = () => { if (controller) controller.abort(); history = []; showEmpty(); input.focus(); };
+// A dot on Settings while a system prompt is set, so it is never active unseen
+const markSystem = () => $("settingsBtn").classList.toggle("on", !!$("system").value.trim());
+$("system").addEventListener("input", markSystem);
+markSystem();
 
 input.addEventListener("input", () => { input.style.height = "auto"; input.style.height = input.scrollHeight + "px"; });
 input.addEventListener("keydown", (e) => {
@@ -195,12 +206,13 @@ function markdown(src) {
   return out.join("");
 }
 
-function addUser(text) {
+// The system prompt shows as a quiet note of its own, the user's turns as bubbles.
+function addText(role, text) {
   if (log.querySelector(".empty")) log.innerHTML = "";
   const m = document.createElement("div");
-  m.className = "msg user";
-  m.innerHTML = '<div class="bubble"></div>';
-  m.firstChild.textContent = text;
+  m.className = "msg " + role;
+  m.innerHTML = role === "system" ? '<span class="label">System prompt</span><span class="text"></span>' : '<div class="text"></div>';
+  m.querySelector(".text").textContent = text;
   log.appendChild(m);
 }
 
@@ -224,22 +236,24 @@ $("composer").addEventListener("submit", async (e) => {
   const text = input.value.trim();
   if (!text) return;
   input.value = ""; input.style.height = "auto";
-  addUser(text);
   const convo = history;   // "New chat" starts another; this reply stays with its own
+  if (!convo.length) {
+    // The system prompt is fixed for the whole chat and shown as its own turn.
+    const system = $("system").value.trim();
+    if (system) { convo.push({ role: "system", content: system }); addText("system", system); }
+  }
+  addText("user", text);
   convo.push({ role: "user", content: text });
   const view = addAssistant();
   toBottom();
 
-  const messages = [];
-  if ($("system").value.trim()) messages.push({ role: "system", content: $("system").value.trim() });
-  messages.push(...convo);
-  const body = { messages, stream: true, temperature: parseFloat($("temperature").value), top_p: parseFloat($("top_p").value) };
+  const body = { messages: convo.slice(), stream: true, temperature: parseFloat($("temperature").value), top_p: parseFloat($("top_p").value) };
   const maxTokens = parseInt($("max_tokens").value, 10);
   if (maxTokens > 0) body.max_tokens = maxTokens;
 
   controller = new AbortController();
   setBusy(true);
-  let reasoning = "", content = "", timings = null, finish = null;
+  let reasoning = "", content = "", timings = null, finish = null, failed = false;
   const started = performance.now();
   let thinkEnded = null;
   try {
@@ -286,6 +300,7 @@ $("composer").addEventListener("submit", async (e) => {
     }
   } catch (err) {
     if (err.name !== "AbortError") {
+      failed = true;
       view.body.insertAdjacentHTML("beforeend", '<p class="error">' + escapeHTML(String(err.message || err)) + "</p>");
     } else {
       finish = "stopped";
@@ -303,8 +318,10 @@ $("composer").addEventListener("submit", async (e) => {
   }
   if (finish === "length") parts.push("hit the token limit");
   if (finish === "stopped") parts.push("stopped");
+  // A failed or empty reply leaves no turn behind, so the next message is not sent after a broken one.
+  if (failed || !content) { convo.pop(); if (failed) parts.push("not kept in the conversation"); }
+  else convo.push({ role: "assistant", content });
   view.stats.textContent = parts.join(" · ");
-  convo.push({ role: "assistant", content });
   controller = null;
   setBusy(false);
   input.focus();
