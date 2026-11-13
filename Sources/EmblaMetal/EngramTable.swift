@@ -83,6 +83,7 @@ public final class EngramTable: @unchecked Sendable {
     /// Reads `rows` (groups of 4 sharing a page) and writes them dequantized as bf16 bits,
     /// `rows.count × 128` values: q·scale + bias in fp32, rounded to bf16, as the reference does.
     public func read(rows: [Int], into e: UnsafeMutablePointer<UInt16>) {
+        nonisolated(unsafe) let e = e
         let groups = rows.count / Self.pageHeads
         let fd = self.fd, wo = weightOffset, so = scalesOffset, bo = biasesOffset
         DispatchQueue.concurrentPerform(iterations: groups) { g in
