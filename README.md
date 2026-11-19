@@ -35,8 +35,9 @@ request runs at a time.
 
 Send `tools` as in OpenAI's API, and a call comes back as `tool_calls` with
 `finish_reason: "tool_calls"` (in a stream, each call whole in one delta). Send the results back
-as `tool` messages. `tool_choice` is `"auto"` or `"none"`: a call cannot be forced, and such a
-request is refused. `parallel_tool_calls: false` keeps the first call.
+as `tool` messages. `tool_choice` is `"auto"`, `"none"`, `"required"` or a named function: a
+forced call still reasons first, then the reply continues from the call's opening tag. A named
+function, or `parallel_tool_calls: false`, keeps the first call and drops any others.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \

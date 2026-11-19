@@ -113,11 +113,11 @@ final class ChatTests: XCTestCase {
         var reasoning = "", content = "", call: String?, finish = "", made = 0, prompts: [[Int]] = []
     }
 
-    func scripted(_ scripts: [String], tools: Bool = true, stop: [String] = [], max: Int = 1000,
+    func scripted(_ scripts: [String], tools: Bool = true, force: String? = nil, stop: [String] = [], max: Int = 1000,
                   _ tok: Tokenizer) -> Scripted {
         var out = Scripted(), queue = scripts.map(tok.encode)
         let r = ChatModel.Request(prompt: [1], maxTokens: max, sampling: Sampling(temperature: 0, topP: 1, seed: 0),
-                                  stop: stop, thinking: true, tools: tools)
+                                  stop: stop, thinking: true, tools: tools || force != nil, forceCall: force)
         (out.finish, out.made) = ChatModel.reply(r, tokenizer: tok, generate: { prompt, count, onToken in
             out.prompts.append(prompt)
             for id in (queue.isEmpty ? [] : queue.removeFirst()).prefix(count) where !onToken(id) { break }
@@ -159,6 +159,37 @@ final class ChatTests: XCTestCase {
         r = scripted([reply], max: tok.encode("Two cities.\n</think>\n\nLet me check.\n\n<tool_call>\n<function").count, tok)
         XCTAssertEqual(r.finish, "length")
         XCTAssertTrue(ToolCall.parse(r.call ?? "", tools: []).isEmpty)
+    }
+
+    /// A forced call (tool_choice): the reasoning runs, then the reply goes on from the call's opening
+    /// tag, its prompt the tokens so far and the tag's (needs the tokenizer in the cache).
+    func testForcedCall() throws {
+        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        let tok = try Tokenizer(url: dir.appendingPathComponent("tokenizer.json"))
+        let rest = "<parameter=a>\n1\n</parameter>\n</function>\n</tool_call><|im_end|>"
+
+        // a named tool: the text after </think> is not the model's to choose
+        var r = scripted(["Must call f.\n</think>\n\nI would rather not.", rest], force: "f", tok)
+        XCTAssertEqual([r.reasoning, r.content, r.call, r.finish], ["Must call f.", "", "\n<function=f>\n" + rest.replacingOccurrences(of: "<|im_end|>", with: ""), "stop"])
+        XCTAssertEqual(r.prompts, [[1], [1] + tok.encode("Must call f.\n</think>") + tok.encode("\n\n<tool_call>\n<function=f>\n")])
+        XCTAssertEqual(ToolCall.parse(r.call!, tools: []).map { JSON.object($0.arguments).text }, [#"{"a": "1"}"#])
+        // any tool: the model names it
+        r = scripted(["Any.\n</think>", "<function=g>\n</function>\n</tool_call><|im_end|>"], force: "", tok)
+        XCTAssertEqual(ToolCall.parse(r.call!, tools: []).map(\.name), ["g"])
+        XCTAssertEqual(r.prompts.last, [1] + tok.encode("Any.\n</think>") + tok.encode("\n\n<tool_call>\n"))
+        // a reply that ends, or starts a call, inside its reasoning: </think> is written for it
+        for end in ["<|im_end|>", "<tool_call>"] {
+            r = scripted(["Hmm" + end, rest], force: "f", tok)
+            XCTAssertEqual(r.prompts.last, [1] + tok.encode("Hmm") + tok.encode("\n</think>\n\n<tool_call>\n<function=f>\n"), end)
+            XCTAssertEqual(ToolCall.parse(r.call!, tools: []).map(\.name), ["f"], end)
+        }
+        // no room left for the call: one generate, cut off
+        r = scripted(["Long.\n</think>", rest], force: "f", max: 4, tok)
+        XCTAssertEqual([r.finish, String(r.prompts.count)], ["length", "1"])
+        XCTAssertLessThanOrEqual(r.made, 4)
+        // made counts the tag's tokens with the model's
+        r = scripted(["Must call f.\n</think>", rest], force: "f", tok)
+        XCTAssertEqual(r.made, tok.encode("Must call f.\n</think>").count + tok.encode("\n\n<tool_call>\n<function=f>\n").count + tok.encode(rest).count)
     }
 
     /// Ordered JSON reads JSON (strictly: no trailing comma) and writes what Python's json.dumps writes.

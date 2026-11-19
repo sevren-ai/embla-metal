@@ -28,14 +28,20 @@ public final class ChatModel: @unchecked Sendable {
         public var thinking: Bool
         /// The prompt offered tools: the reply after `<tool_call>` is its calls, not content.
         public var tools: Bool
+        /// A call is forced (`tool_choice`): "" for any of the tools, else that tool's name. The model
+        /// reasons as usual; where its reasoning ends, the reply goes on from `<tool_call>` (and
+        /// `<function=name>`), the tokens so far and those of the tag continuing from the prefix cache.
+        public var forceCall: String?
 
-        public init(prompt: [Int], maxTokens: Int, sampling: Sampling, stop: [String] = [], thinking: Bool, tools: Bool = false) {
+        public init(prompt: [Int], maxTokens: Int, sampling: Sampling, stop: [String] = [], thinking: Bool, tools: Bool = false,
+                    forceCall: String? = nil) {
             self.prompt = prompt
             self.maxTokens = maxTokens
             self.sampling = sampling
             self.stop = stop
             self.thinking = thinking
             self.tools = tools
+            self.forceCall = forceCall
         }
     }
 
@@ -87,6 +93,8 @@ public final class ChatModel: @unchecked Sendable {
         var calling = false          // after <tool_call>
         let hold = max(0, (r.stop.map(\.count).max() ?? 0) - 1)
         var finish = "length", made = 0, alive = true
+        var generated: [Int] = []    // the reply's tokens, for a forced call's second part
+        var callDue: Bool?           // a forced call is to start here; true when the reasoning was closed by </think>
 
         func emitContent(final: Bool) -> Bool {
             if let s = r.stop.compactMap({ content.range(of: $0) }).min(by: { $0.lowerBound < $1.lowerBound }) {
@@ -105,8 +113,15 @@ public final class ChatModel: @unchecked Sendable {
             return emit(calling ? .call(out) : .content(out))
         }
 
-        generate(r.prompt, r.maxTokens) { id in
+        func onToken(_ id: Int) -> Bool {
             made += 1
+            generated.append(id)
+            // a forced call: the reasoning ends here (a call or an end inside it ends it too), and the call follows
+            if r.forceCall != nil && !calling && (id == thinkClose || id == toolCall || endIDs.contains(id)) {
+                if id != thinkClose { generated.removeLast(); made -= 1 }
+                callDue = id == thinkClose
+                return false
+            }
             if endIDs.contains(id) { finish = "stop"; return false }
             if thinking && id == thinkClose {
                 thinking = false
@@ -140,6 +155,22 @@ public final class ChatModel: @unchecked Sendable {
             content += piece
             alive = emitContent(final: false) && alive
             return alive && finish != "stop"
+        }
+
+        generate(r.prompt, r.maxTokens, onToken)
+        // as the template writes a reply that is only calls: "</think>\n\n<tool_call>\n<function=name>\n"
+        let afterTag = r.forceCall.map { "\n" + ($0.isEmpty ? "" : "<function=" + $0 + ">\n") } ?? ""
+        let opening = callDue.map { tokenizer.encode(($0 ? "" : (reasonHeld.isEmpty ? "\n" : "") + "</think>") + "\n\n<tool_call>" + afterTag) } ?? []
+        // the call goes on only with room for its tag and a token after it; else the reply was cut off
+        if callDue != nil, alive, made + opening.count < r.maxTokens {
+            if case let rest = text.flush(), thinking, !rest.isEmpty { alive = emit(.reasoning(rest)) }
+            thinking = false
+            calling = true
+            contentStarted = true
+            made += opening.count
+            alive = emit(.call("")) && alive
+            content = afterTag
+            if alive { generate(r.prompt + generated + opening, r.maxTokens - made, onToken) }
         }
         content += text.flush()
         if alive && finish != "stop" || !content.isEmpty { _ = emitContent(final: true) }
