@@ -139,9 +139,10 @@ public final class Server: @unchecked Sendable {
                 }
                 return c.isOpen
             }
-            // a reply cut off inside its first call has no call to make: its text stays content
+            // a reply whose <tool_call> holds no call in the format keeps that text as content; one cut
+            // off by max_tokens inside its first call is dropped (its markup is not an answer)
             let calls = Array(ToolCall.parse(called ?? "", tools: tools).prefix(oneCall ? 1 : .max))
-            if calls.isEmpty, let called {
+            if calls.isEmpty, let called, out.finishReason != "length" {
                 let text = (content.isEmpty ? "" : "\n\n") + "<tool_call>" + called
                 content += text
                 if stream { c.event(chunk(id, created, chat, ["content": text])) }
@@ -174,7 +175,8 @@ public final class Server: @unchecked Sendable {
             } else {
                 var choice: [String: Any] = ["index": 0, "finish_reason": finish]
                 if chat {
-                    var message: [String: Any] = ["role": "assistant", "content": content]
+                    // as OpenAI: a reply that is only calls has null content
+                    var message: [String: Any] = ["role": "assistant", "content": content.isEmpty && !calls.isEmpty ? NSNull() : content]
                     if !reasoning.isEmpty { message["reasoning_content"] = reasoning }
                     if !calls.isEmpty { message["tool_calls"] = toolCalls }
                     choice["message"] = message
