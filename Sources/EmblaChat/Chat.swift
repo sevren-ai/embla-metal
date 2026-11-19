@@ -7,9 +7,6 @@ public final class ChatModel: @unchecked Sendable {
     public let engine: Engine
     public let tokenizer: Tokenizer
     public let directory: URL
-    let endIDs: Set<Int>
-    let thinkClose: Int?
-    let toolCall: Int?
 
     public init(directory: URL, context: Int) throws {
         let config = directory.appendingPathComponent("config.json")
@@ -20,9 +17,6 @@ public final class ChatModel: @unchecked Sendable {
         tokenizer = try Tokenizer(url: directory.appendingPathComponent("tokenizer.json"))
         engine = try Engine(modelDirectory: directory, maxContext: context)
         self.directory = directory
-        endIDs = Set(["<|im_end|>", "<|endoftext|>"].compactMap(tokenizer.id(of:)))
-        thinkClose = tokenizer.id(of: "</think>")
-        toolCall = tokenizer.id(of: "<tool_call>")
     }
 
     public struct Request: Sendable {
@@ -61,6 +55,30 @@ public final class ChatModel: @unchecked Sendable {
 
     /// Generates, handing text to `emit` as it comes; `emit` returning false stops (a client gone).
     public func run(_ r: Request, emit: (Delta) -> Bool) -> Outcome {
+        let t0 = Date()
+        var firstAt: Date?
+        var cached: Int?
+        let (finish, made) = Self.reply(r, tokenizer: tokenizer, generate: { [engine] prompt, count, onToken in
+            _ = engine.generate(prompt: prompt, count: count, sampling: r.sampling) { id in
+                if firstAt == nil { firstAt = Date() }
+                return onToken(id)
+            }
+            if cached == nil { cached = engine.reusedTokens }
+        }, emit: emit)
+        let promptMs = (firstAt ?? Date()).timeIntervalSince(t0) * 1e3
+        return Outcome(finishReason: finish, promptTokens: r.prompt.count, completionTokens: made,
+                       cachedTokens: cached ?? 0, promptMs: promptMs, decodeMs: Date().timeIntervalSince(firstAt ?? Date()) * 1e3)
+    }
+
+    /// The reply's text from its tokens: `generate(prompt, count, onToken)` runs the model (the
+    /// engine, or a script in the tests), `onToken` returning false stopping it. Returns the finish
+    /// reason and the tokens made. (`generate` is escaping only to satisfy exclusivity checking: it
+    /// is called before this returns.)
+    static func reply(_ r: Request, tokenizer: Tokenizer,
+                      generate: @escaping (_ prompt: [Int], _ count: Int, _ onToken: (Int) -> Bool) -> Void,
+                      emit: (Delta) -> Bool) -> (finish: String, made: Int) {
+        let endIDs = Set(["<|im_end|>", "<|endoftext|>"].compactMap(tokenizer.id(of:)))
+        let thinkClose = tokenizer.id(of: "</think>"), toolCall = tokenizer.id(of: "<tool_call>")
         var text = TextStream()
         var thinking = r.thinking
         var reasonHeld = ""          // trailing newlines of the reasoning, dropped at </think>
@@ -69,8 +87,6 @@ public final class ChatModel: @unchecked Sendable {
         var calling = false          // after <tool_call>
         let hold = max(0, (r.stop.map(\.count).max() ?? 0) - 1)
         var finish = "length", made = 0, alive = true
-        let t0 = Date()
-        var firstAt: Date?
 
         func emitContent(final: Bool) -> Bool {
             if let s = r.stop.compactMap({ content.range(of: $0) }).min(by: { $0.lowerBound < $1.lowerBound }) {
@@ -89,8 +105,7 @@ public final class ChatModel: @unchecked Sendable {
             return emit(calling ? .call(out) : .content(out))
         }
 
-        _ = engine.generate(prompt: r.prompt, count: r.maxTokens, sampling: r.sampling) { [self] id in
-            if firstAt == nil { firstAt = Date() }
+        generate(r.prompt, r.maxTokens) { id in
             made += 1
             if endIDs.contains(id) { finish = "stop"; return false }
             if thinking && id == thinkClose {
@@ -128,8 +143,6 @@ public final class ChatModel: @unchecked Sendable {
         }
         content += text.flush()
         if alive && finish != "stop" || !content.isEmpty { _ = emitContent(final: true) }
-        let promptMs = (firstAt ?? Date()).timeIntervalSince(t0) * 1e3
-        return Outcome(finishReason: finish, promptTokens: r.prompt.count, completionTokens: made,
-                       cachedTokens: engine.reusedTokens, promptMs: promptMs, decodeMs: Date().timeIntervalSince(firstAt ?? Date()) * 1e3)
+        return (finish, made)
     }
 }
