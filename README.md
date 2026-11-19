@@ -33,6 +33,11 @@ Embla 1 thinks before it answers: the reasoning streams as `reasoning_content`, 
 `content`. Sampling defaults to temperature 0.6 and top-p 0.95; `temperature: 0` is greedy. One
 request runs at a time.
 
+Send `tools` as in OpenAI's API, and a call comes back as `tool_calls` with
+`finish_reason: "tool_calls"` (in a stream, each call whole in one delta). Send the results back
+as `tool` messages. `tool_choice` is `"auto"` or `"none"`: a call cannot be forced, and such a
+request is refused. `parallel_tool_calls: false` keeps the first call.
+
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"messages": [{"role": "user", "content": "What is the capital of Denmark?"}]}'

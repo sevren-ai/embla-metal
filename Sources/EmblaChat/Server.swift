@@ -2,8 +2,9 @@ import EmblaMetal
 import Foundation
 import Network
 
-/// An OpenAI-compatible HTTP server for a `ChatModel`: `/v1/chat/completions`, `/v1/completions`
-/// and `/v1/models`, streaming or not, and the chat page at `/`. Requests queue for the one engine.
+/// An OpenAI-compatible HTTP server for a `ChatModel`: `/v1/chat/completions` (with tools),
+/// `/v1/completions` and `/v1/models`, streaming or not, and the chat page at `/`. Requests queue
+/// for the one engine.
 ///
 /// This server has no authentication or TLS and allows cross-origin requests. It is intended for
 /// loopback use; network exposure requires an authenticated TLS reverse proxy.
@@ -70,18 +71,29 @@ public final class Server: @unchecked Sendable {
             return c.error(400, "the body is not a JSON object")
         }
         let prompt: [Int]
+        let tools: [JSON]
         do {
             if chat {
                 guard let raw = body["messages"] as? [[String: Any]] else { throw ChatError.badRequest("need messages") }
-                let messages = try raw.map { m -> ChatMessage in
+                // the tools and the calls' arguments in the client's order, which `body` does not keep
+                let ordered = body["tools"] == nil && !raw.contains { $0["tool_calls"] != nil } ? nil : try JSON(req.body)
+                let turns = ordered?["messages"]?.items ?? []
+                let choice = body["tool_choice"] ?? NSNull()
+                guard choice is NSNull || ["auto", "none"].contains(choice as? String) else {
+                    throw ChatError.badRequest("tool_choice is \"auto\" or \"none\": a call cannot be forced")
+                }
+                tools = choice as? String == "none" ? [] : ordered?["tools"]?.items ?? []
+                let messages = try raw.enumerated().map { i, m -> ChatMessage in
                     guard let role = m["role"] as? String else { throw ChatError.badRequest("a message without a role") }
                     return ChatMessage(role: role, content: try Self.text(m["content"]),
-                                       reasoning: (m["reasoning_content"] ?? m["reasoning"]) as? String)
+                                       reasoning: (m["reasoning_content"] ?? m["reasoning"]) as? String,
+                                       toolCalls: try (i < turns.count ? turns[i]["tool_calls"] : nil)?.items.map(ToolCall.init) ?? [])
                 }
-                prompt = model.tokenizer.encode(try ChatTemplate.render(messages))
+                prompt = model.tokenizer.encode(try ChatTemplate.render(messages, tools: tools))
             } else {
                 guard let p = body["prompt"] as? String else { throw ChatError.badRequest("need a prompt (a string)") }
                 prompt = model.tokenizer.encode(p)
+                tools = []
                 guard !prompt.isEmpty else { throw ChatError.badRequest("an empty prompt") }
             }
         } catch {
@@ -98,9 +110,10 @@ public final class Server: @unchecked Sendable {
         let stop = (body["stop"] as? [String]) ?? (body["stop"] as? String).map { [$0] } ?? []
         let stream = body["stream"] as? Bool ?? false
         let usageInStream = (body["stream_options"] as? [String: Any])?["include_usage"] as? Bool ?? false
+        let oneCall = body["parallel_tool_calls"] as? Bool == false
         let request = ChatModel.Request(prompt: prompt, maxTokens: max(1, min(asked ?? room, room)),
                                         sampling: Sampling(temperature: temperature, topP: topP, seed: seed),
-                                        stop: stop.filter { !$0.isEmpty }, thinking: chat)
+                                        stop: stop.filter { !$0.isEmpty }, thinking: chat, tools: !tools.isEmpty)
         let id = (chat ? "chatcmpl-" : "cmpl-") + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24).lowercased()
         let created = Int(Date().timeIntervalSince1970)
         let object = chat ? "chat.completion" : "text_completion"
@@ -109,6 +122,7 @@ public final class Server: @unchecked Sendable {
         gen.async { [self] in
             guard c.isOpen else { return }
             var reasoning = "", content = ""
+            var called: String?   // the reply after <tool_call>, once there is one
             if stream {
                 c.event(chunk(id, created, chat, chat ? ["role": "assistant", "content": ""] : nil, text: chat ? nil : ""))
             }
@@ -120,9 +134,23 @@ public final class Server: @unchecked Sendable {
                 case .content(let s):
                     content += s
                     if stream { c.event(chunk(id, created, chat, chat ? ["content": s] : nil, text: chat ? nil : s)) }
+                case .call(let s):
+                    called = (called ?? "") + s
                 }
                 return c.isOpen
             }
+            // a reply cut off inside its first call has no call to make: its text stays content
+            let calls = Array(ToolCall.parse(called ?? "", tools: tools).prefix(oneCall ? 1 : .max))
+            if calls.isEmpty, let called {
+                let text = (content.isEmpty ? "" : "\n\n") + "<tool_call>" + called
+                content += text
+                if stream { c.event(chunk(id, created, chat, ["content": text])) }
+            }
+            let toolCalls: [[String: Any]] = calls.map { call in
+                ["id": "call_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24).lowercased(),
+                 "type": "function", "function": ["name": call.name, "arguments": JSON.object(call.arguments).text]]
+            }
+            let finish = calls.isEmpty || out.finishReason == "length" ? out.finishReason : "tool_calls"
             let usage: [String: Any] = ["prompt_tokens": out.promptTokens, "completion_tokens": out.completionTokens,
                                         "total_tokens": out.promptTokens + out.completionTokens,
                                         "prompt_tokens_details": ["cached_tokens": out.cachedTokens]]
@@ -130,10 +158,13 @@ public final class Server: @unchecked Sendable {
                                           "prompt_ms": out.promptMs, "predicted_n": out.completionTokens, "predicted_ms": out.decodeMs]
             log(String(format: "%@ %d prompt tokens, %d from the cache (%.0f ms), %d new (%.1f tok/s), %@%@", chat ? "chat" : "completion",
                        out.promptTokens, out.cachedTokens, out.promptMs, out.completionTokens,
-                       Double(max(0, out.completionTokens - 1)) / max(1e-9, out.decodeMs / 1e3), out.finishReason,
+                       Double(max(0, out.completionTokens - 1)) / max(1e-9, out.decodeMs / 1e3), finish,
                        c.isOpen ? "" : " (client left)"))
             if stream {
-                var last = chunk(id, created, chat, chat ? [:] : nil, text: chat ? nil : "", finish: out.finishReason)
+                if !calls.isEmpty {
+                    c.event(chunk(id, created, chat, ["tool_calls": toolCalls.enumerated().map { i, call in call.merging(["index": i]) { $1 } }]))
+                }
+                var last = chunk(id, created, chat, chat ? [:] : nil, text: chat ? nil : "", finish: finish)
                 last["timings"] = timings
                 c.event(last)
                 if usageInStream {
@@ -141,10 +172,11 @@ public final class Server: @unchecked Sendable {
                 }
                 c.endEvents()
             } else {
-                var choice: [String: Any] = ["index": 0, "finish_reason": out.finishReason]
+                var choice: [String: Any] = ["index": 0, "finish_reason": finish]
                 if chat {
                     var message: [String: Any] = ["role": "assistant", "content": content]
                     if !reasoning.isEmpty { message["reasoning_content"] = reasoning }
+                    if !calls.isEmpty { message["tool_calls"] = toolCalls }
                     choice["message"] = message
                 } else {
                     choice["text"] = content

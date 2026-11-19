@@ -9,6 +9,7 @@ public final class ChatModel: @unchecked Sendable {
     public let directory: URL
     let endIDs: Set<Int>
     let thinkClose: Int?
+    let toolCall: Int?
 
     public init(directory: URL, context: Int) throws {
         let config = directory.appendingPathComponent("config.json")
@@ -21,6 +22,7 @@ public final class ChatModel: @unchecked Sendable {
         self.directory = directory
         endIDs = Set(["<|im_end|>", "<|endoftext|>"].compactMap(tokenizer.id(of:)))
         thinkClose = tokenizer.id(of: "</think>")
+        toolCall = tokenizer.id(of: "<tool_call>")
     }
 
     public struct Request: Sendable {
@@ -30,17 +32,21 @@ public final class ChatModel: @unchecked Sendable {
         public var stop: [String]
         /// The prompt opened a `<think>` block: text until `</think>` is reasoning.
         public var thinking: Bool
+        /// The prompt offered tools: the reply after `<tool_call>` is its calls, not content.
+        public var tools: Bool
 
-        public init(prompt: [Int], maxTokens: Int, sampling: Sampling, stop: [String] = [], thinking: Bool) {
+        public init(prompt: [Int], maxTokens: Int, sampling: Sampling, stop: [String] = [], thinking: Bool, tools: Bool = false) {
             self.prompt = prompt
             self.maxTokens = maxTokens
             self.sampling = sampling
             self.stop = stop
             self.thinking = thinking
+            self.tools = tools
         }
     }
 
-    public enum Delta { case reasoning(String), content(String) }
+    /// `call` is the reply after `<tool_call>`, for `ToolCall.parse`: an empty one as the tag comes, then its text.
+    public enum Delta { case reasoning(String), content(String), call(String) }
 
     public struct Outcome {
         public var finishReason: String
@@ -59,7 +65,8 @@ public final class ChatModel: @unchecked Sendable {
         var thinking = r.thinking
         var reasonHeld = ""          // trailing newlines of the reasoning, dropped at </think>
         var contentStarted = false   // newlines after </think> are dropped
-        var content = ""             // content not yet emitted (held for the stop strings)
+        var content = ""             // content, or after <tool_call> the call's text, not yet emitted (held for the stop strings)
+        var calling = false          // after <tool_call>
         let hold = max(0, (r.stop.map(\.count).max() ?? 0) - 1)
         var finish = "length", made = 0, alive = true
         let t0 = Date()
@@ -69,16 +76,17 @@ public final class ChatModel: @unchecked Sendable {
             if let s = r.stop.compactMap({ content.range(of: $0) }).min(by: { $0.lowerBound < $1.lowerBound }) {
                 let before = String(content[..<s.lowerBound])
                 content = ""
-                if !before.isEmpty { alive = emit(.content(before)) && alive }
+                if !before.isEmpty { alive = emit(calling ? .call(before) : .content(before)) && alive }
                 finish = "stop"
                 return false
             }
-            let keep = final ? 0 : hold
+            // with tools, also the two newlines the template puts before a <tool_call>: they are not content
+            let keep = final ? 0 : max(hold, r.tools ? content.suffix(2).reversed().prefix { $0 == "\n" }.count : 0)
             guard content.count > keep else { return true }
             let cut = content.index(content.endIndex, offsetBy: -keep)
             let out = String(content[..<cut])
             content = String(content[cut...])
-            return emit(.content(out))
+            return emit(calling ? .call(out) : .content(out))
         }
 
         _ = engine.generate(prompt: r.prompt, count: r.maxTokens, sampling: r.sampling) { [self] id in
@@ -89,6 +97,15 @@ public final class ChatModel: @unchecked Sendable {
                 thinking = false
                 reasonHeld = ""
                 return true
+            }
+            // unless a stop string ends at the tag: then it is content, and the reply stops there
+            if r.tools && !calling && id == toolCall && !r.stop.contains(where: { (content + "<tool_call>").contains($0) }) {
+                thinking = false   // a call from inside the reasoning ends it, as </think> would
+                while content.hasSuffix("\n") { content.removeLast() }
+                alive = emitContent(final: true) && alive
+                calling = true
+                contentStarted = true   // the call's text is kept as it comes
+                return emit(.call("")) && alive
             }
             var piece = text.push(tokenizer.specialIDs.contains(id) ? [] : tokenizer.bytes(id))
             guard !piece.isEmpty else { return true }
