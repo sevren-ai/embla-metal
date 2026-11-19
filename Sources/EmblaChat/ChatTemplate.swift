@@ -61,7 +61,7 @@ public enum ChatTemplate {
                     while c.hasPrefix("\n") { c.removeFirst() }
                     content = c
                 }
-                let calls = render(m.toolCalls, after: content)
+                let calls = renderToolCalls(m.toolCalls, after: content)
                 if i > lastUser {
                     // after the last user turn (a reply still being built): its reasoning stays
                     reasoning = trim(reasoning)
@@ -86,7 +86,7 @@ public enum ChatTemplate {
     }
 
     /// The template's `render_tool_calls`: an assistant turn's calls, after its content.
-    static func render(_ calls: [ToolCall], after content: String) -> String {
+    static func renderToolCalls(_ calls: [ToolCall], after content: String) -> String {
         var out = ""
         for (i, call) in calls.enumerated() {
             out += (i > 0 ? "\n" : content.isEmpty ? "" : "\n\n") + "<tool_call>\n<function=" + call.name + ">\n"

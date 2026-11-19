@@ -78,7 +78,7 @@ final class ChatTests: XCTestCase {
                        #"{"query": "42", "limit": 42, "zip": "01234", "tag": "true", "filter": {"lang": "da"}, "note": "two\nlines"}"#)
         XCTAssertEqual(JSON.object(calls[1].arguments).text, "{}")
         // the template writes them back as the model wrote them
-        XCTAssertEqual(ChatTemplate.render(calls, after: ""), reply)
+        XCTAssertEqual(ChatTemplate.renderToolCalls(calls, after: ""), reply)
         // without a schema a value stays a string, and a value may hold the format's own tags
         let html = ToolCall.parse("\n<function=write>\n<parameter=n>\n42\n</parameter>\n<parameter=text>\n<b></function>\n<parameter=x>\n</parameter>\n</function>", tools: tools)
         XCTAssertEqual(html.map { JSON.object($0.arguments).text }, [#"{"n": "42", "text": "<b></function>\n<parameter=x>"}"#])

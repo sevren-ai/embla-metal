@@ -37,7 +37,10 @@ Send `tools` as in OpenAI's API, and a call comes back as `tool_calls` with
 `finish_reason: "tool_calls"` (in a stream, each call whole in one delta). Send the results back
 as `tool` messages. `tool_choice` is `"auto"`, `"none"`, `"required"` or a named function: a
 forced call still reasons first, then the reply continues from the call's opening tag. A named
-function, or `parallel_tool_calls: false`, keeps the first call and drops any others.
+function, or `parallel_tool_calls: false`, keeps the first call and drops any others. Send a
+reply's `reasoning_content` back with its `tool_calls`: the template keeps the reasoning of the
+turns since the last user message, so without it the next request cannot take that reply from
+the prefix cache (OpenAI's SDK leaves it out unless you add it).
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' \

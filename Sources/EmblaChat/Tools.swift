@@ -70,8 +70,30 @@ public enum JSON: Sendable {
     }
 
     private struct Parser {
+        /// JSON's number grammar, -?(0|[1-9][0-9]*)(.[0-9]+)?([eE][+-]?[0-9]+)?: nil when `w` is not
+        /// a number, else whether it has a fraction or an exponent.
+        static func isFloat(_ w: ArraySlice<UInt8>) -> Bool? {
+            var i = w.startIndex
+            func at(_ c: Character) -> Bool { i < w.endIndex && w[i] == c.asciiValue }
+            func digits() -> Int {
+                let s = i
+                while i < w.endIndex, (UInt8(ascii: "0") ... UInt8(ascii: "9")).contains(w[i]) { i += 1 }
+                return i - s
+            }
+            if at("-") { i += 1 }
+            if at("0") { i += 1 } else if digits() == 0 { return nil }
+            var float = false
+            if at(".") { i += 1; guard digits() > 0 else { return nil }; float = true }
+            if at("e") || at("E") {
+                i += 1
+                if at("+") || at("-") { i += 1 }
+                guard digits() > 0 else { return nil }
+                float = true
+            }
+            return i == w.endIndex ? float : nil
+        }
+
         static let bad = ChatError.badRequest("not JSON, or nested too deep")
-        nonisolated(unsafe) static let number = /-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/   // built once: a literal in place is built for every number
         let b: [UInt8]
         var i = 0, depth = 0
 
@@ -132,8 +154,8 @@ public enum JSON: Sendable {
                 while i < b.count, !",]} \t\n\r".utf8.contains(b[i]) { i += 1 }
                 let word = String(decoding: b[start ..< i], as: UTF8.self)
                 if ["null", "true", "false"].contains(word) { return .literal(word) }
-                guard let number = word.wholeMatch(of: Self.number) else { throw Self.bad }
-                if number.2 == nil && number.3 == nil { return .literal(word == "-0" ? "0" : word) }
+                guard let float = Self.isFloat(b[start ..< i]) else { throw Self.bad }
+                if !float { return .literal(word == "-0" ? "0" : word) }
                 // a float as Python writes it (1e3 is 1000.0): Swift's, but from 2^53 to 1e16 Swift has an exponent
                 guard let d = Double(word), d.isFinite else { throw Self.bad }
                 return .literal(d.magnitude >= 0x1p53 && d.magnitude < 1e16 ? String(format: "%.1f", d) : "\(d)")
