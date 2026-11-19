@@ -1,3 +1,4 @@
+import EmblaMetal
 import Foundation
 import XCTest
 
@@ -77,7 +78,7 @@ final class ChatTests: XCTestCase {
                        #"{"query": "42", "limit": 42, "zip": "01234", "tag": "true", "filter": {"lang": "da"}, "note": "two\nlines"}"#)
         XCTAssertEqual(JSON.object(calls[1].arguments).text, "{}")
         // the template writes them back as the model wrote them
-        XCTAssertEqual(ChatTemplate.render(calls, after: ""), reply)
+        XCTAssertEqual(ChatTemplate.renderToolCalls(calls, after: ""), reply)
         // without a schema a value stays a string, and a value may hold the format's own tags
         let html = ToolCall.parse("\n<function=write>\n<parameter=n>\n42\n</parameter>\n<parameter=text>\n<b></function>\n<parameter=x>\n</parameter>\n</function>", tools: tools)
         XCTAssertEqual(html.map { JSON.object($0.arguments).text }, [#"{"n": "42", "text": "<b></function>\n<parameter=x>"}"#])
@@ -104,6 +105,91 @@ final class ChatTests: XCTestCase {
         for bad in [#"{"function":{"arguments":"{}"}}"#, #"{"function":{"name":"f","arguments":"{\"a\":"}}"#, #"{"function":{"name":"f","arguments":"[]"}}"#] {
             XCTAssertThrowsError(try ToolCall(JSON(Data(bad.utf8))), bad)
         }
+    }
+
+    /// What `ChatModel.reply` made of a scripted model: each `generate` call takes the next script's
+    /// tokens (up to its count), and `prompts` records the prompt each call was given.
+    struct Scripted {
+        var reasoning = "", content = "", call: String?, finish = "", made = 0, prompts: [[Int]] = []
+    }
+
+    func scripted(_ scripts: [String], tools: Bool = true, force: String? = nil, stop: [String] = [], max: Int = 1000,
+                  _ tok: Tokenizer) -> Scripted {
+        var out = Scripted(), queue = scripts.map(tok.encode)
+        let r = ChatModel.Request(prompt: [1], maxTokens: max, sampling: Sampling(temperature: 0, topP: 1, seed: 0),
+                                  stop: stop, thinking: true, tools: tools || force != nil, forceCall: force)
+        (out.finish, out.made) = ChatModel.reply(r, tokenizer: tok, generate: { prompt, count, onToken in
+            out.prompts.append(prompt)
+            for id in (queue.isEmpty ? [] : queue.removeFirst()).prefix(count) where !onToken(id) { break }
+        }, emit: { delta in
+            switch delta {
+            case .reasoning(let s): out.reasoning += s
+            case .content(let s): out.content += s
+            case .call(let s): out.call = (out.call ?? "") + s
+            }
+            return true
+        })
+        return out
+    }
+
+    /// The reply's text split into reasoning, content and a call's text, as tokens arrive (needs the tokenizer in the cache).
+    func testReplyStream() throws {
+        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        let tok = try Tokenizer(url: dir.appendingPathComponent("tokenizer.json"))
+        let call = "\n<function=f>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>"
+        let reply = "Two cities.\n</think>\n\nLet me check.\n\n<tool_call>" + call + "<|im_end|>"
+
+        // content, then the call: the blank lines before the tag are neither
+        var r = scripted([reply], tok)
+        XCTAssertEqual([r.reasoning, r.content, r.call, r.finish], ["Two cities.", "Let me check.", call, "stop"])
+        XCTAssertEqual(ToolCall.parse(r.call!, tools: []).map(\.name), ["f"])
+        // without tools the tag is text
+        r = scripted([reply], tools: false, tok)
+        XCTAssertEqual([r.content, r.call], ["Let me check.\n\n<tool_call>" + call, nil])
+        // blank lines that no tag follows stay
+        r = scripted(["r\n</think>\n\na\n\nb<|im_end|>"], tok)
+        XCTAssertEqual([r.content, r.call], ["a\n\nb", nil])
+        // a call from inside the reasoning ends it
+        r = scripted(["Need weather.\n<tool_call>\n<function=f>\n</function>\n</tool_call><|im_end|>"], tok)
+        XCTAssertEqual([r.reasoning, r.content, r.call], ["Need weather.", "", "\n<function=f>\n</function>\n</tool_call>"])
+        // a stop string that ends at the tag: the tag is content, and the reply stops there
+        r = scripted([reply], stop: ["check.\n\n<tool_call>"], tok)
+        XCTAssertEqual([r.content, r.call, r.finish], ["Let me ", nil, "stop"])
+        // cut off by max_tokens inside the call
+        r = scripted([reply], max: tok.encode("Two cities.\n</think>\n\nLet me check.\n\n<tool_call>\n<function").count, tok)
+        XCTAssertEqual(r.finish, "length")
+        XCTAssertTrue(ToolCall.parse(r.call ?? "", tools: []).isEmpty)
+    }
+
+    /// A forced call (tool_choice): the reasoning runs, then the reply goes on from the call's opening
+    /// tag, its prompt the tokens so far and the tag's (needs the tokenizer in the cache).
+    func testForcedCall() throws {
+        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        let tok = try Tokenizer(url: dir.appendingPathComponent("tokenizer.json"))
+        let rest = "<parameter=a>\n1\n</parameter>\n</function>\n</tool_call><|im_end|>"
+
+        // a named tool: the text after </think> is not the model's to choose
+        var r = scripted(["Must call f.\n</think>\n\nI would rather not.", rest], force: "f", tok)
+        XCTAssertEqual([r.reasoning, r.content, r.call, r.finish], ["Must call f.", "", "\n<function=f>\n" + rest.replacingOccurrences(of: "<|im_end|>", with: ""), "stop"])
+        XCTAssertEqual(r.prompts, [[1], [1] + tok.encode("Must call f.\n</think>") + tok.encode("\n\n<tool_call>\n<function=f>\n")])
+        XCTAssertEqual(ToolCall.parse(r.call!, tools: []).map { JSON.object($0.arguments).text }, [#"{"a": "1"}"#])
+        // any tool: the model names it
+        r = scripted(["Any.\n</think>", "<function=g>\n</function>\n</tool_call><|im_end|>"], force: "", tok)
+        XCTAssertEqual(ToolCall.parse(r.call!, tools: []).map(\.name), ["g"])
+        XCTAssertEqual(r.prompts.last, [1] + tok.encode("Any.\n</think>") + tok.encode("\n\n<tool_call>\n"))
+        // a reply that ends, or starts a call, inside its reasoning: </think> is written for it
+        for end in ["<|im_end|>", "<tool_call>"] {
+            r = scripted(["Hmm" + end, rest], force: "f", tok)
+            XCTAssertEqual(r.prompts.last, [1] + tok.encode("Hmm") + tok.encode("\n</think>\n\n<tool_call>\n<function=f>\n"), end)
+            XCTAssertEqual(ToolCall.parse(r.call!, tools: []).map(\.name), ["f"], end)
+        }
+        // no room left for the call: one generate, cut off
+        r = scripted(["Long.\n</think>", rest], force: "f", max: 4, tok)
+        XCTAssertEqual([r.finish, String(r.prompts.count)], ["length", "1"])
+        XCTAssertLessThanOrEqual(r.made, 4)
+        // made counts the tag's tokens with the model's
+        r = scripted(["Must call f.\n</think>", rest], force: "f", tok)
+        XCTAssertEqual(r.made, tok.encode("Must call f.\n</think>").count + tok.encode("\n\n<tool_call>\n<function=f>\n").count + tok.encode(rest).count)
     }
 
     /// Ordered JSON reads JSON (strictly: no trailing comma) and writes what Python's json.dumps writes.

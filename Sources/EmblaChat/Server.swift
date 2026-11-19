@@ -72,6 +72,7 @@ public final class Server: @unchecked Sendable {
         }
         let prompt: [Int]
         let tools: [JSON]
+        var force: String?   // tool_choice forces a call: "" any tool, else its name
         do {
             if chat {
                 guard let raw = body["messages"] as? [[String: Any]] else { throw ChatError.badRequest("need messages") }
@@ -79,10 +80,24 @@ public final class Server: @unchecked Sendable {
                 let ordered = body["tools"] == nil && !raw.contains { $0["tool_calls"] != nil } ? nil : try JSON(req.body)
                 let turns = ordered?["messages"]?.items ?? []
                 let choice = body["tool_choice"] ?? NSNull()
-                guard choice is NSNull || ["auto", "none"].contains(choice as? String) else {
-                    throw ChatError.badRequest("tool_choice is \"auto\" or \"none\": a call cannot be forced")
+                switch choice {
+                case is NSNull, "auto" as String, "none" as String: break
+                case "required" as String: force = ""
+                case let o as [String: Any] where o["type"] as? String == "function":
+                    guard let name = (o["function"] as? [String: Any])?["name"] as? String else {
+                        throw ChatError.badRequest("tool_choice names no function")
+                    }
+                    force = name
+                default:
+                    throw ChatError.badRequest(#"tool_choice is "auto", "none", "required" or {"type": "function", "function": {"name": ...}}"#)
                 }
                 tools = choice as? String == "none" ? [] : ordered?["tools"]?.items ?? []
+                let names = tools.compactMap { $0["function"]?["name"]?.string }
+                if let f = force {
+                    guard !tools.isEmpty else { throw ChatError.badRequest("tool_choice forces a call, but the request has no tools") }
+                    guard f.isEmpty || names.contains(f) else { throw ChatError.badRequest("tool_choice names \(f), which is not among the tools") }
+                    if f.isEmpty && names.count == 1 { force = names[0] }   // one tool: the call is to it
+                }
                 let messages = try raw.enumerated().map { i, m -> ChatMessage in
                     guard let role = m["role"] as? String else { throw ChatError.badRequest("a message without a role") }
                     return ChatMessage(role: role, content: try Self.text(m["content"]),
@@ -110,10 +125,12 @@ public final class Server: @unchecked Sendable {
         let stop = (body["stop"] as? [String]) ?? (body["stop"] as? String).map { [$0] } ?? []
         let stream = body["stream"] as? Bool ?? false
         let usageInStream = (body["stream_options"] as? [String: Any])?["include_usage"] as? Bool ?? false
-        let oneCall = body["parallel_tool_calls"] as? Bool == false
+        // a named tool_choice is one call to that tool
+        let oneCall = body["parallel_tool_calls"] as? Bool == false || body["tool_choice"] is [String: Any]
         let request = ChatModel.Request(prompt: prompt, maxTokens: max(1, min(asked ?? room, room)),
                                         sampling: Sampling(temperature: temperature, topP: topP, seed: seed),
-                                        stop: stop.filter { !$0.isEmpty }, thinking: chat, tools: !tools.isEmpty)
+                                        stop: stop.filter { !$0.isEmpty }, thinking: chat, tools: !tools.isEmpty,
+                                        forceCall: force)
         let id = (chat ? "chatcmpl-" : "cmpl-") + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24).lowercased()
         let created = Int(Date().timeIntervalSince1970)
         let object = chat ? "chat.completion" : "text_completion"
@@ -139,9 +156,10 @@ public final class Server: @unchecked Sendable {
                 }
                 return c.isOpen
             }
-            // a reply cut off inside its first call has no call to make: its text stays content
+            // a reply whose <tool_call> holds no call in the format keeps that text as content; one cut
+            // off by max_tokens inside its first call is dropped (its markup is not an answer)
             let calls = Array(ToolCall.parse(called ?? "", tools: tools).prefix(oneCall ? 1 : .max))
-            if calls.isEmpty, let called {
+            if calls.isEmpty, let called, out.finishReason != "length" {
                 let text = (content.isEmpty ? "" : "\n\n") + "<tool_call>" + called
                 content += text
                 if stream { c.event(chunk(id, created, chat, ["content": text])) }
@@ -174,7 +192,8 @@ public final class Server: @unchecked Sendable {
             } else {
                 var choice: [String: Any] = ["index": 0, "finish_reason": finish]
                 if chat {
-                    var message: [String: Any] = ["role": "assistant", "content": content]
+                    // as OpenAI: a reply that is only calls has null content
+                    var message: [String: Any] = ["role": "assistant", "content": content.isEmpty && !calls.isEmpty ? NSNull() : content]
                     if !reasoning.isEmpty { message["reasoning_content"] = reasoning }
                     if !calls.isEmpty { message["tool_calls"] = toolCalls }
                     choice["message"] = message
