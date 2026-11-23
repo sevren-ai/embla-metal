@@ -221,7 +221,7 @@ kernel void attn_full_b(
     device const bfloat* g2      [[buffer(2)]],
     device const kv_t*   kc      [[buffer(3)]],
     device const kv_t*   vc      [[buffer(4)]],
-    device float*        part    [[buffer(5)]],   // [T][C][16][HD + 1]
+    coherent(device) device float* part [[buffer(5)]],   // [T][C][16][HD + 1]
     device atomic_uint*  counter [[buffer(6)]],   // [T][2]
     device bfloat*       o       [[buffer(7)]],   // [T][D]
     constant AttnB&      p       [[buffer(8)]],
@@ -265,7 +265,7 @@ kernel void attn_full_b(
         }
     }
 #endif
-    device float* pp = part + ((size_t(tok) * p.C + c) * 16 + h) * (HD + 1);
+    coherent(device) device float* pp = part + ((size_t(tok) * p.C + c) * 16 + h) * (HD + 1);
     for (int i = 0; i < 4; i++) pp[lane + 32 * i] = acc[i];
     if (lane == 0) pp[HD] = psum;
 
@@ -274,7 +274,7 @@ kernel void attn_full_b(
     const int hh = kvh * 8 + int(t) / 32, d0 = (int(t) % 32) * 4;
     float den = sqrt(float(HD)), num[4] = {0, 0, 0, 0};
     for (int cc = 0; cc < p.C; cc++) {
-        device const float* q2 = part + ((size_t(tok) * p.C + cc) * 16 + hh) * (HD + 1);
+        coherent(device) device const float* q2 = part + ((size_t(tok) * p.C + cc) * 16 + hh) * (HD + 1);
         den += q2[HD];
         for (int n = 0; n < 4; n++) num[n] += q2[d0 + n];
     }

@@ -151,7 +151,7 @@ kernel void attn_full(
     device const bfloat* g2      [[buffer(2)]],
     device const bfloat* kc      [[buffer(3)]],
     device const bfloat* vc      [[buffer(4)]],
-    device float*        part    [[buffer(5)]],   // [C][16][HD + 1]
+    coherent(device) device float* part [[buffer(5)]],   // [C][16][HD + 1]
     device float*        scores  [[buffer(6)]],   // [2][maxS]
     device atomic_uint*  counter [[buffer(7)]],
     device bfloat*       o       [[buffer(8)]],
@@ -194,7 +194,7 @@ kernel void attn_full(
             }
         }
     }
-    device float* pp = part + (size_t(c) * 16 + h) * (HD + 1);
+    coherent(device) device float* pp = part + (size_t(c) * 16 + h) * (HD + 1);
     for (int i = 0; i < 4; i++) pp[lane + 32 * i] = acc[i];
     if (lane == 0) pp[HD] = psum;
     if (SCORES) {
@@ -212,7 +212,7 @@ kernel void attn_full(
     const int hh = kvh * 8 + int(t) / 32, d0 = (int(t) % 32) * 4;
     float den = sqrt(float(HD)), num[4] = {0, 0, 0, 0};
     for (int cc = 0; cc < p.C; cc++) {
-        device const float* q2 = part + (size_t(cc) * 16 + hh) * (HD + 1);
+        coherent(device) device const float* q2 = part + (size_t(cc) * 16 + hh) * (HD + 1);
         den += q2[HD];
         for (int n = 0; n < 4; n++) num[n] += q2[d0 + n];
     }
@@ -238,7 +238,7 @@ kernel void attn_full8(
     device const bfloat* g2      [[buffer(2)]],
     device const char*   kc      [[buffer(3)]],
     device const char*   vc      [[buffer(4)]],
-    device float*        part    [[buffer(5)]],   // [C][16][HD + 1]
+    coherent(device) device float* part [[buffer(5)]],   // [C][16][HD + 1]
     device float*        scores  [[buffer(6)]],   // [2][maxS]
     device atomic_uint*  counter [[buffer(7)]],
     device bfloat*       o       [[buffer(8)]],
@@ -336,7 +336,7 @@ kernel void attn_full8(
 
     // the simdgroups' sums into this chunk's partial, thread t: head t / 16, dims (t % 16) · 8 ..
     const int th = int(t) / 16, d0 = (int(t) % 16) * 8;
-    device float* pp = part + (size_t(c) * 16 + kvh * 8 + th) * (HD + 1);
+    coherent(device) device float* pp = part + (size_t(c) * 16 + kvh * 8 + th) * (HD + 1);
     for (int e = 0; e < 8; e++) {
         float v = 0.0f;
         for (int g = 0; g < NSG; g++) v += ot[g][th][ocol(d0 + e)];
@@ -355,7 +355,7 @@ kernel void attn_full8(
     if (!arrive_last(counter + kvh, uint(p.C), t, &last)) return;
     float den = sqrt(float(HD)), num[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int cc = 0; cc < p.C; cc++) {
-        device const float* q2 = part + (size_t(cc) * 16 + kvh * 8 + th) * (HD + 1);
+        coherent(device) device const float* q2 = part + (size_t(cc) * 16 + kvh * 8 + th) * (HD + 1);
         den += q2[HD];
         for (int e = 0; e < 8; e++) num[e] += q2[d0 + e];
     }
@@ -373,7 +373,7 @@ kernel void attn_sparse(
     device const bfloat* g2      [[buffer(2)]],
     device const kv_t*   kc      [[buffer(3)]],
     device const kv_t*   vc      [[buffer(4)]],
-    device float*        part    [[buffer(5)]],   // [C][16][HD + 2]
+    coherent(device) device float* part [[buffer(5)]],   // [C][16][HD + 2]
     device const uint*   idx     [[buffer(6)]],   // [2][S]
     device atomic_uint*  counter [[buffer(7)]],
     device bfloat*       o       [[buffer(8)]],
@@ -421,7 +421,7 @@ kernel void attn_sparse(
         for (int i = 0; i < 4; i++) acc[i] = acc[i] * cf + w * vv[i];
         m = mn;
     }
-    device float* pp = part + (size_t(c) * 16 + h) * (HD + 2);
+    coherent(device) device float* pp = part + (size_t(c) * 16 + h) * (HD + 2);
     for (int i = 0; i < 4; i++) pp[lane + 32 * i] = acc[i];
     if (lane == 0) { pp[HD] = m; pp[HD + 1] = l; }
 
@@ -432,7 +432,7 @@ kernel void attn_sparse(
     for (int cc = 0; cc < p.C; cc++) M = max(M, part[(size_t(cc) * 16 + hh) * (HD + 2) + HD]);
     float L = 0.0f, num[4] = {0, 0, 0, 0};
     for (int cc = 0; cc < p.C; cc++) {
-        device const float* q2 = part + (size_t(cc) * 16 + hh) * (HD + 2);
+        coherent(device) device const float* q2 = part + (size_t(cc) * 16 + hh) * (HD + 2);
         const float f = exp(q2[HD] - M);
         L += q2[HD + 1] * f;
         for (int n = 0; n < 4; n++) num[n] += q2[d0 + n] * f;
@@ -451,7 +451,7 @@ kernel void attn_sparse8(
     device const bfloat* g2      [[buffer(2)]],
     device const char*   kc      [[buffer(3)]],
     device const char*   vc      [[buffer(4)]],
-    device float*        part    [[buffer(5)]],   // [C][16][HD + 2]
+    coherent(device) device float* part [[buffer(5)]],   // [C][16][HD + 2]
     device const uint*   idx     [[buffer(6)]],   // [2][S]
     device atomic_uint*  counter [[buffer(7)]],
     device bfloat*       o       [[buffer(8)]],
@@ -561,7 +561,7 @@ kernel void attn_sparse8(
         for (int e = 0; e < 8; e++) o[hh * HD + d0 + e] = bfloat(num[e] / L);
         return;
     }
-    device float* pp = part + (size_t(c) * 16 + hh) * (HD + 2);
+    coherent(device) device float* pp = part + (size_t(c) * 16 + hh) * (HD + 2);
     for (int e = 0; e < 8; e++) pp[d0 + e] = num[e];
     if (t % 16 == 0) {
         pp[HD] = M;
@@ -575,7 +575,7 @@ kernel void attn_sparse8(
     L = 0.0f;
     for (int e = 0; e < 8; e++) num[e] = 0.0f;
     for (int cc = 0; cc < p.C; cc++) {
-        device const float* q2 = part + (size_t(cc) * 16 + hh) * (HD + 2);
+        coherent(device) device const float* q2 = part + (size_t(cc) * 16 + hh) * (HD + 2);
         const float f = exp(q2[HD] - M);
         L += q2[HD + 1] * f;
         for (int e = 0; e < 8; e++) num[e] += q2[d0 + e] * f;
