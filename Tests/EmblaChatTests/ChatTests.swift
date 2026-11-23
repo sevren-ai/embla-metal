@@ -59,7 +59,7 @@ final class ChatTests: XCTestCase {
 
     /// The instructions after the tools are the template's, character for character (needs the model in the cache).
     func testToolFormat() throws {
-        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        let dir = try cachedModel()
         let jinja = try String(contentsOf: dir.appendingPathComponent("chat_template.jinja"), encoding: .utf8)
         XCTAssertTrue(jinja.contains("'" + ChatTemplate.toolFormat.replacingOccurrences(of: "\n", with: "\\n") + "'"))
     }
@@ -134,7 +134,7 @@ final class ChatTests: XCTestCase {
 
     /// The reply's text split into reasoning, content and a call's text, as tokens arrive (needs the tokenizer in the cache).
     func testReplyStream() throws {
-        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        let dir = try cachedModel()
         let tok = try Tokenizer(url: dir.appendingPathComponent("tokenizer.json"))
         let call = "\n<function=f>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>"
         let reply = "Two cities.\n</think>\n\nLet me check.\n\n<tool_call>" + call + "<|im_end|>"
@@ -164,7 +164,7 @@ final class ChatTests: XCTestCase {
     /// A forced call (tool_choice): the reasoning runs, then the reply goes on from the call's opening
     /// tag, its prompt the tokens so far and the tag's (needs the tokenizer in the cache).
     func testForcedCall() throws {
-        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        let dir = try cachedModel()
         let tok = try Tokenizer(url: dir.appendingPathComponent("tokenizer.json"))
         let rest = "<parameter=a>\n1\n</parameter>\n</function>\n</tool_call><|im_end|>"
 
@@ -232,7 +232,7 @@ final class ChatTests: XCTestCase {
 
     /// The tokenizer round-trips text and matches known ids (needs the model in the cache).
     func testTokenizer() throws {
-        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        let dir = try cachedModel()
         let tok = try Tokenizer(url: dir.appendingPathComponent("tokenizer.json"))
         // transformers: "The capital of Denmark is"
         XCTAssertEqual(tok.encode("The capital of Denmark is"), [758, 6426, 314, 29103, 368])
@@ -240,5 +240,15 @@ final class ChatTests: XCTestCase {
             XCTAssertEqual(tok.decode(tok.encode(text), skipSpecial: false), text)
         }
         XCTAssertEqual(tok.encode("<think>"), [tok.id(of: "<think>")!])
+    }
+
+    /// The default model from the Hugging Face cache, or a skip: absent, or not macOS (no `ModelStore`).
+    private func cachedModel() throws -> URL {
+        #if os(macOS)
+        guard let dir = ModelStore.resolve(ModelStore.defaultRepo) else { throw XCTSkip("no \(ModelStore.defaultRepo) in the cache") }
+        return dir
+        #else
+        throw XCTSkip("ModelStore is macOS only")
+        #endif
     }
 }

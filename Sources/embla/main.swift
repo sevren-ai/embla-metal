@@ -1,3 +1,5 @@
+// The `embla` command is macOS only: it fetches models with `ModelStore`, which iOS doesn't have.
+#if os(macOS)
 import EmblaChat
 import Foundation
 
@@ -101,3 +103,4 @@ func serve(modelDirectory: URL, name: String, host: String, port: Int, context: 
     }
     dispatchMain()
 }
+#endif

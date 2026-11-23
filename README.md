@@ -94,6 +94,12 @@ There is no iPhone app here: the engine builds for iOS 18 or later, and an app o
 `EMBLA_*` settings come as the app's environment variables; `EMBLA_KERNELS=<dir>` (relative to
 the app's Documents) loads `<name>.metal` files from there instead of the built-in ones.
 
+The app owns the model too: it downloads and stores the bundle (config.json, model.safetensors,
+engram_table.safetensors, tokenizer.json) where it keeps its data, for example under Application
+Support excluded from iCloud backup, and passes that folder to `Engine(modelDirectory:)`.
+`ModelStore`, the Hugging Face cache download behind `embla download`, is macOS only: an iOS app
+can't write `~/.cache` inside its container.
+
 ## Development
 
 ```bash
@@ -109,7 +115,7 @@ EMBLA_BATCH=0 .build/release/embla-bench cache $M 1024 32   # the same, strict: 
 ```
 
 Swift 6 (Xcode 16 or later). The libraries: `EmblaMetal` (the engine), `EmblaChat` (tokenizer,
-chat template, download, server) and `EmblaBenchKit` (the bench commands).
+chat template, server, and on macOS the download) and `EmblaBenchKit` (the bench commands).
 
 ## License
 

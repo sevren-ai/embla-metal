@@ -1,8 +1,13 @@
+#if os(macOS)
 import CryptoKit
 import Foundation
 
 /// Models in the Hugging Face cache (`~/.cache/huggingface/hub`, or HF_HUB_CACHE / HF_HOME), in
 /// its layout, so a model fetched here or with `hf download` is the same files.
+///
+/// macOS only: the `embla` command fetches its own model. On iOS the app that links the engine owns
+/// downloading and storage (an app can't write `~/.cache` inside its container) and hands
+/// `Engine(modelDirectory:)` a folder.
 public enum ModelStore {
     public static let defaultRepo = "sevren-ai/Embla1-4bit"
     public static let required = ["config.json", "model.safetensors", "engram_table.safetensors", "tokenizer.json"]
@@ -15,7 +20,7 @@ public enum ModelStore {
 
     static var hfHome: URL {
         if let h = ProcessInfo.processInfo.environment["HF_HOME"], !h.isEmpty { return URL(fileURLWithPath: (h as NSString).expandingTildeInPath) }
-        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/huggingface")
+        return URL.homeDirectory.appendingPathComponent(".cache/huggingface")
     }
 
     static func repoDir(_ repo: String) -> URL {
@@ -201,3 +206,4 @@ public enum ModelStore {
         }
     }
 }
+#endif
