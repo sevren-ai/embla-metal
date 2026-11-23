@@ -8,12 +8,9 @@ public final class ChatModel: @unchecked Sendable {
     public let tokenizer: Tokenizer
     public let directory: URL
 
+    /// Any model the engine runs: `Engine` reads its config.json and refuses, by name, what it does not
+    /// run (`Engine.check`); the model's name or type does not matter.
     public init(directory: URL, context: Int) throws {
-        let config = directory.appendingPathComponent("config.json")
-        let type = ((try? JSONSerialization.jsonObject(with: Data(contentsOf: config))) as? [String: Any])?["model_type"] as? String
-        guard let type, ["embla", "embla1"].contains(type) else {
-            throw ChatError.badModel("\(directory.path) is not an Embla 1 model (config.json's model_type is \(type ?? "missing"))")
-        }
         tokenizer = try Tokenizer(url: directory.appendingPathComponent("tokenizer.json"))
         engine = try Engine(modelDirectory: directory, maxContext: context)
         self.directory = directory

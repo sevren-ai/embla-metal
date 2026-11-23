@@ -47,7 +47,7 @@ func runCache(_ args: [String]) throws {
     struct Run { var tokens: [Int], logits: [Float], seconds: Double, reused: Int }
     func run(_ prompt: [Int]) -> Run {
         let r = engine.generate(prompt: prompt, count: n)
-        let logits = Array(UnsafeBufferPointer(start: engine.logits.contents().assumingMemoryBound(to: Float.self), count: Embla.vocab))
+        let logits = Array(UnsafeBufferPointer(start: engine.logits.contents().assumingMemoryBound(to: Float.self), count: engine.config.vocab))
         return Run(tokens: r.tokens, logits: logits, seconds: engine.prefillSeconds, reused: engine.reusedTokens)
     }
     /// From scratch: no cache used, nothing stored. It leaves the same sequence in the live caches

@@ -86,6 +86,10 @@ Prompts on the iPhone run at 4.7-5.1k tokens a second. Sampling costs ~2% agains
   computed by decode steps, so greedy continuations can part at near-ties. `EMBLA_PREFIX_CACHE=0`
   turns it off.
 - **Checked** against a reference implementation's logits step by step (`embla-bench check`).
+- **Driven by `config.json`:** the engine reads the model's shape from the checkpoint's config
+  (`ModelConfig`): its layer kinds, MLP kinds, K/V sources, AttnRes blocks and sizes. The plans,
+  buffers and per-token layouts derive from it. `Engine.check` refuses, by name, a config option the
+  engine does not run or a shape its kernels are not written for, rather than running it wrong.
 
 ## On an iPhone
 

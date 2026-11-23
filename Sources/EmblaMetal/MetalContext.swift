@@ -10,7 +10,7 @@ public final class MetalContext: @unchecked Sendable {
 
     public init() throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
-            throw EmblaError.noMetal
+            throw EngineError.noMetal
         }
         self.device = device
         self.queue = queue
@@ -47,7 +47,7 @@ public final class MetalContext: @unchecked Sendable {
             // Metal 4 for the tensor ops (MetalPerformancePrimitives, macOS 26), 3.2 otherwise
             options.languageVersion = .version3_2
             if source.contains("MetalPerformancePrimitives") {
-                guard #available(macOS 26.0, iOS 26.0, *) else { throw EmblaError.noMetal }
+                guard #available(macOS 26.0, iOS 26.0, *) else { throw EngineError.noMetal }
                 options.languageVersion = .version4_0
             }
             options.preprocessorMacros = macros.mapValues { NSNumber(value: $0) }
@@ -75,16 +75,23 @@ public final class MetalContext: @unchecked Sendable {
     }
 }
 
-public enum EmblaError: Error, CustomStringConvertible {
+public enum EngineError: Error, CustomStringConvertible {
     case noMetal
     case badFile(String)
     case missingTensor(String)
+    /// The model needs something this engine does not run (a config option, or a shape its kernels
+    /// are not written for).
+    case unsupported(String)
 
     public var description: String {
         switch self {
         case .noMetal: return "no Metal device"
         case .badFile(let s): return "bad file: \(s)"
         case .missingTensor(let s): return "missing tensor: \(s)"
+        case .unsupported(let s): return "unsupported model: \(s)"
         }
     }
 }
+
+@available(*, deprecated, renamed: "EngineError")
+public typealias EmblaError = EngineError

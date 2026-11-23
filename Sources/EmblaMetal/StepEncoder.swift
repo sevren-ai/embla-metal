@@ -75,7 +75,7 @@ public final class Profiler {
 
     init(device: MTLDevice) throws {
         self.device = device
-        guard let set = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else { throw EmblaError.noMetal }
+        guard let set = device.counterSets?.first(where: { $0.name == MTLCommonCounterSet.timestamp.rawValue }) else { throw EngineError.noMetal }
         self.set = set
     }
 

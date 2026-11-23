@@ -21,29 +21,29 @@ public final class SafeTensors: @unchecked Sendable {
     public init(url: URL, device: MTLDevice) throws {
         self.url = url
         let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { throw EmblaError.badFile(url.path) }
+        guard fd >= 0 else { throw EngineError.badFile(url.path) }
         defer { close(fd) }
         var st = stat()
-        guard fstat(fd, &st) == 0 else { throw EmblaError.badFile(url.path) }
+        guard fstat(fd, &st) == 0 else { throw EngineError.badFile(url.path) }
         let size = Int(st.st_size)
         // Metal needs a page-aligned pointer and a length in whole pages; mmap gives the first and
         // maps the tail of the last page as zeros.
         let page = Int(getpagesize())
         mappedLength = (size + page - 1) / page * page
         guard let p = mmap(nil, mappedLength, PROT_READ, MAP_PRIVATE, fd, 0), p != MAP_FAILED else {
-            throw EmblaError.badFile("mmap \(url.path)")
+            throw EngineError.badFile("mmap \(url.path)")
         }
         base = p
         guard let buffer = device.makeBuffer(bytesNoCopy: p, length: mappedLength, options: .storageModeShared, deallocator: nil) else {
             munmap(p, mappedLength)
-            throw EmblaError.badFile("no Metal buffer over \(url.path)")
+            throw EngineError.badFile("no Metal buffer over \(url.path)")
         }
         self.buffer = buffer
 
         let headerLength = Int(p.loadUnaligned(as: UInt64.self))
         let header = Data(bytes: p + 8, count: headerLength)
         guard let json = try JSONSerialization.jsonObject(with: header) as? [String: Any] else {
-            throw EmblaError.badFile("header of \(url.path)")
+            throw EngineError.badFile("header of \(url.path)")
         }
         var tensors: [String: Tensor] = [:]
         for (name, v) in json where name != "__metadata__" {
@@ -59,7 +59,7 @@ public final class SafeTensors: @unchecked Sendable {
     public subscript(name: String) -> Tensor? { tensors[name] }
 
     public func tensor(_ name: String) throws -> Tensor {
-        guard let t = tensors[name] else { throw EmblaError.missingTensor(name) }
+        guard let t = tensors[name] else { throw EngineError.missingTensor(name) }
         return t
     }
 }

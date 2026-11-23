@@ -15,14 +15,14 @@ func runCheck(_ args: [String]) throws {
     let t0 = Date()
     let engine = try Engine(modelDirectory: model, maxContext: 4096)
     print(String(format: "engine ready in %.2f s", Date().timeIntervalSince(t0)))
-    let dbg = engine.ctx.buffer(UInt16.self, count: 100 * Embla.d)
+    let dbg = engine.ctx.buffer(UInt16.self, count: 100 * engine.config.hidden)
     var logits = Data()
     var produced: [Int] = []
     for (s, tok) in tokens.enumerated() {
         engine.debugMixes = mixSteps.contains(s) ? dbg : nil
         let (next, gpu) = engine.step(tok)
         produced.append(next)
-        if s >= from { logits.append(Data(bytes: engine.logits.contents(), count: Embla.vocab * 4)) }
+        if s >= from { logits.append(Data(bytes: engine.logits.contents(), count: engine.config.vocab * 4)) }
         if mixSteps.contains(s) {
             try Data(bytes: dbg.contents(), count: dbg.length).write(to: out.appendingPathComponent("mix_\(s).bf16"))
         }
@@ -46,7 +46,7 @@ func runGen(_ args: [String]) throws {
                  p, engine.prefillSeconds * 1e3, Double(p) / engine.prefillSeconds, engine.prefillGPU * 1e3, engine.prefillRead * 1e3, 1 / r.wallPerToken))
     try r.tokens.map(String.init).joined(separator: " ").write(toFile: args[4], atomically: true, encoding: .utf8)
     if let dump = ProcessInfo.processInfo.environment["EMBLA_DUMP_LOGITS"] {   // the last step's logits, f32
-        try Data(bytes: engine.logits.contents(), count: Embla.vocab * 4).write(to: URL(fileURLWithPath: dump))
+        try Data(bytes: engine.logits.contents(), count: engine.config.vocab * 4).write(to: URL(fileURLWithPath: dump))
     }
     if ProcessInfo.processInfo.environment["EMBLA_TWICE"] != nil {
         _ = engine.generate(prompt: Array(tokens[..<p]), count: 2)   // warm: the engram rows read once

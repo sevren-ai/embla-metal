@@ -3,29 +3,6 @@ import Metal
 import QuartzCore
 import Synchronization
 
-/// Embla 1's shape (`embla1`).
-public enum Embla {
-    public static let d = 2048, layers = 32, headDim = 128, vocab = 65536
-    public static let window = 128, topk = 1024, recent = 128, blockSize = 4
-    /// Layers of the prefill half: a prompt token whose logits are not needed stops at layer 16's K/V.
-    public static let prefillLayers = 16
-    public static let experts = 96, expertDim = 512, sharedDim = 1024
-
-    public enum Kind: Sendable { case sliding, full, sparse }
-    public static let kinds: [Kind] = (0 ..< 32).map { i in
-        i < 16 ? (i == 7 ? .full : .sliding) : ((i - 16) % 4 == 0 ? .full : .sparse)
-    }
-    /// Full layer -> the layer whose (normed, mixed) input its K/V project.
-    public static let kvSources = [7: 7, 16: 16, 20: 16, 24: 7, 28: 7]
-    /// K/V source layer -> the later full layers that project its input.
-    public static let bridges: [Int: [Int]] = [7: [24, 28], 16: [20]]
-    public static func blockFull(_ i: Int) -> Int { (0 ..< i).last { kinds[$0] == .full }! }
-    /// Full layers whose keys the sparse layers after them select from.
-    public static let selects: Set<Int> = Set((0 ..< 32).filter { i in
-        kinds[i] == .full && (i + 1 ..< 32).contains { kinds[$0] == .sparse && blockFull($0) == i }
-    })
-}
-
 /// One stacked-GEMV segment, as `Seg` in gemv.metal.
 struct Seg {
     var w: UInt64, s: UInt64, b: UInt64
@@ -48,7 +25,12 @@ struct MoEWeights {
 /// step into one command buffer.
 public final class Engine: @unchecked Sendable {
     public let ctx: MetalContext
+    /// The model's shape, from its config.json: every plan, buffer and kernel instantiation below
+    /// derives from it.
+    public let config: ModelConfig
     public let weights: SafeTensors
+    /// Full layers whose keys the sparse layers after them select from (config.selects, kept).
+    let selects: Set<Int>
     public let table: EngramTable
     public let maxContext: Int
     public internal(set) var position = 0
@@ -100,7 +82,7 @@ public final class Engine: @unchecked Sendable {
     /// grows by what they cost in place.
     public var twice: Set<String> = []
 
-    var ids: [UInt64] = [UInt64(Embla.vocab), UInt64(Embla.vocab)]
+    var ids: [UInt64] = []
 
     // ------------------------------------------------------------------ pipelines and plans
 
@@ -111,7 +93,7 @@ public final class Engine: @unchecked Sendable {
 
     struct Layer {
         let i: Int
-        let kind: Embla.Kind
+        let kind: ModelConfig.Attention
         /// The q/k/v GEMV, which computes its input mixes (columns attnCol ..) itself, and the router
         /// (or layer 0's c_fc), which computes its own (mlpCol).
         let qkvPipe: MTLComputePipelineState, mlpPipe: MTLComputePipelineState
@@ -141,7 +123,7 @@ public final class Engine: @unchecked Sendable {
     var prep0: (pipe: MTLComputePipelineState, col: Int32, count: Int)!
     var prep1: (pipe: MTLComputePipelineState, col: Int32, count: Int)!
     let pSliding, pKV, pFull, pFullScores, pSparse, pSparseSel, pSparseShort, pSelect: MTLComputePipelineState
-    var reduceTGs: Int { Embla.d * reduceGroups / 256 }
+    var reduceTGs: Int { config.hidden * reduceGroups / 256 }
     let dots: MTLBuffer
     let pFused, pShared, pReduce, pEmbed, pGate, pArgmax, pSample, pCopy: MTLComputePipelineState
     /// How `generate` picks each token (greedy unless it is told otherwise).
@@ -200,12 +182,67 @@ public final class Engine: @unchecked Sendable {
             if FileManager.default.fileExists(atPath: url.path) { return try String(contentsOf: url, encoding: .utf8) }
         }
         guard let url = Bundle.module.url(forResource: n, withExtension: "metal", subdirectory: "Kernels") else {
-            throw EmblaError.badFile("Kernels/\(n).metal")
+            throw EngineError.badFile("Kernels/\(n).metal")
         }
         return try String(contentsOf: url, encoding: .utf8)
     }
 
+    /// A kernel file as `kernelSource`, with the model's per-token layouts: NSRC source slots in the
+    /// AttnRes state, NMIX mixes in a mix output (mix.metal, prefill.metal).
+    func kernel(_ name: String) throws -> String {
+        "#define NSRC \(config.sourceSlots)\n#define NMIX \(config.mixSlots)\n" + (try Self.kernelSource(name))
+    }
+
+    /// The shapes the kernels are written for (common.metal's D, HD and EPS; moe.metal's E, TOPK, F,
+    /// FS; attention.metal's heads, TOPK and RECENT; the AttnRes and K/V plans `buildPlans` makes),
+    /// and the config options this engine runs. Anything else is refused by name rather than run wrong.
+    public static func check(_ c: ModelConfig) throws {
+        var no: [String] = c.unknownOptions.map { "\($0) (not run by this engine)" }
+        func need(_ ok: Bool, _ what: @autoclosure () -> String) { if !ok { no.append(what()) } }
+        need(c.hidden == 2048, "hidden_size \(c.hidden) (kernels: 2048)")
+        need(c.headDim == 128, "head_dim \(c.headDim) (kernels: 128)")
+        need(c.heads == 16 && c.kvHeads == 2, "\(c.heads) heads, \(c.kvHeads) kv heads (kernels: 16, 2)")
+        need(c.slidingHeads == 16 && c.slidingKVHeads == 4, "sliding \(c.slidingHeads) heads, \(c.slidingKVHeads) kv heads (kernels: 16, 4)")
+        need(c.window == 128, "sliding_window \(c.window) (kernels: 128)")
+        need(c.sparseTopK == 1024 && c.sparseRecent == 128, "sparse_topk \(c.sparseTopK), sparse_recent \(c.sparseRecent) (kernels: 1024, 128)")
+        need(c.experts == 96 && c.expertsPerToken == 8 && c.expertDim == 512 && c.sharedDim == 1024,
+             "experts \(c.experts) x \(c.expertDim), top \(c.expertsPerToken), shared \(c.sharedDim) (kernels: 96 x 512, top 8, shared 1024)")
+        need(c.denseDim == 2048, "intermediate_size \(c.denseDim) (kernels: 2048)")
+        need(c.rmsEps == 0.0078125, "rms_norm_eps \(c.rmsEps) (kernels: 2^-7)")
+        need(c.logitSoftcap == 15, "final_logit_softcapping \(c.logitSoftcap) (kernels: 15)")
+        need(c.ropeTheta == 10000 && c.ropeFraction == 0.5, "rope theta \(c.ropeTheta), fraction \(c.ropeFraction) (kernels: 10000, 0.5)")
+        need(c.vocab <= 65536, "vocab_size \(c.vocab) (token ids are 16 bits in the step's polled word)")
+        let e = c.engram, t = EngramTable.self
+        need(e.layer == 0 && e.conv == 4 && e.heads == t.heads && e.pageHeads == t.pageHeads && e.headDim == t.dim
+             && e.pages == t.pages && e.pageBytes == 4096 && e.orders.map(UInt64.init) == t.orders,
+             "engram (layer \(e.layer), \(e.heads) heads, \(e.pages) pages, orders \(e.orders)): EngramTable reads one layout, after layer 0")
+        need(c.mlp.first == .dense, "layer 0's MLP \(c.mlp.first.map(\.rawValue) ?? "-") (the step's first command buffer runs a dense one)")
+        for i in 1 ..< c.layers where c.mlp[i] != .moe { need(false, "layer \(i)'s MLP \(c.mlp[i].rawValue) (only layer 0 is dense)") }
+        need(c.attention.first == .sliding, "layer 0's attention \(c.attention.first.map(\.rawValue) ?? "-")")
+        for i in 0 ..< c.layers where c.attention[i] == .sparse { need(c.blockFull(i) != nil, "sparse layer \(i) has no full layer before it") }
+        let full = Set((0 ..< c.layers).filter { c.attention[$0] == .full })
+        need(Set(c.kvSources.keys) == full, "kv_sources must name every full layer")
+        for (f, s) in c.kvSources {
+            need(full.contains(s) && c.kvSources[s] == s, "kv_sources \(f): \(s) is not a full layer that is its own source")
+            need(s <= c.prefillLayers, "kv_sources \(f): \(s) is past the prefill half (num_prefill_layers \(c.prefillLayers))")
+        }
+        need(c.prefillLayers < c.layers && full.contains(c.prefillLayers), "num_prefill_layers \(c.prefillLayers): the prefill half ends at a full layer's K/V")
+        // the q/k/v rows of a layer, and the K/V of the full layers it bridges to, fit the 4096-wide qkv row
+        for i in 0 ..< c.layers {
+            let rows = c.heads * c.headDim + (c.attention[i] == .sliding ? 2 * c.slidingKVHeads * c.headDim
+                : c.kvSources[i] == i ? 2 * c.kvHeads * c.headDim * c.attentionMixes(i) : 0)
+            need(rows <= qkvWidth, "layer \(i)'s q/k/v rows \(rows) (at most \(qkvWidth))")
+        }
+        if !no.isEmpty { throw EngineError.unsupported(no.joined(separator: "; ")) }
+    }
+
+    /// Columns of a token's q/k/v row (and of the prefill's).
+    static let qkvWidth = 4096
+
     public init(modelDirectory: URL, maxContext: Int = 8192, ctx: MetalContext? = nil) throws {
+        config = try ModelConfig.load(directory: modelDirectory)
+        try Self.check(config)
+        selects = config.selects
         let ctx = try ctx ?? MetalContext()
         self.ctx = ctx
         self.maxContext = maxContext
@@ -240,20 +277,20 @@ public final class Engine: @unchecked Sendable {
 
         // activations
         func buf(_ bytes: Int) -> MTLBuffer { dev.makeBuffer(length: bytes, options: .storageModeShared)! }
-        let d = Embla.d
-        state = buf(9 * d * 2)
+        let c = config, d = c.hidden, hd = c.headDim
+        state = buf(c.sourceSlots * d * 2)
         x = buf(d * 4)
-        hs = buf(3 * d * 2)
-        qkv = buf(4096 * 2)
+        hs = buf(c.mixSlots * d * 2)
+        qkv = buf(Self.qkvWidth * 2)
         o = buf(d * 2)
         hmlp = buf(d * 2)
-        rlogits = buf(Embla.experts * 4)
-        route = buf(16 * 4)
-        part = buf(80 * d * 4)
-        apart = buf((maxContext / 64 + 2) * 16 * 130 * 4)
+        rlogits = buf(c.experts * 4)
+        route = buf(2 * c.expertsPerToken * 4)
+        part = buf(Self.moeSlices(c) * d * 4)
+        apart = buf((maxContext / 64 + 2) * c.heads * (hd + 2) * 4)
         counter = buf(64)
-        scores = buf(2 * maxContext * 4)
-        sel = buf(2 * (Embla.topk + Embla.recent) * 4)
+        scores = buf(c.kvHeads * maxContext * 4)
+        sel = buf(c.kvHeads * (c.sparseTopK + c.sparseRecent) * 4)
         e = buf(Self.engramRing * d * 2)   // a ring by position, so the CPU can read ahead
         ekv = buf(2 * d * 2)
         hist = buf(Self.ring * d * 2)
@@ -261,21 +298,23 @@ public final class Engine: @unchecked Sendable {
         greedy = buf((maxContext + 3) * 4)
         engramReady = dev.makeSharedEvent()!
         gpuChain = dev.makeEvent()!
-        m0 = buf(80 * d * 2)
-        stats = buf(80 * 16)
-        logits = buf(Embla.vocab * 4)
-        sampleScratch = buf(Embla.vocab * 4)
+        let columns = Self.queryColumns(c)
+        m0 = buf(columns * d * 2)
+        stats = buf(columns * 16)
+        logits = buf(c.vocab * 4)
+        sampleScratch = buf(c.vocab * 4)
 
-        // caches: 15 sliding rings [4][128][128], then 5 full [2][maxContext][128], k then v each
-        // (with KV8 int8 rows, then their [2][maxContext] float scales)
+        // caches: a ring [kv heads][ring][head dim] for each sliding layer, then [kv heads][maxContext][head dim]
+        // for each full layer, k then v each (with KV8 int8 rows, then their [kv heads][maxContext] float scales)
         var cacheBytes = 0
         var slidingOffset: [Int: (Int, Int)] = [:], fullOffset: [Int: (Int, Int)] = [:]
-        for i in 0 ..< Embla.layers where Embla.kinds[i] == .sliding {
-            slidingOffset[i] = (cacheBytes, cacheBytes + 4 * Self.ring * 128 * 2)
-            cacheBytes += 2 * 4 * Self.ring * 128 * 2
+        for i in 0 ..< c.layers where c.attention[i] == .sliding {
+            let n = c.slidingKVHeads * Self.ring * hd * 2
+            slidingOffset[i] = (cacheBytes, cacheBytes + n)
+            cacheBytes += 2 * n
         }
-        for i in 0 ..< Embla.layers where Embla.kinds[i] == .full {
-            let n = Self.kv8 ? 2 * maxContext * (128 + 4) : 2 * maxContext * 128 * 2
+        for i in 0 ..< c.layers where c.attention[i] == .full {
+            let n = Self.kv8 ? c.kvHeads * maxContext * (hd + 4) : c.kvHeads * maxContext * hd * 2
             fullOffset[i] = (cacheBytes, cacheBytes + n)
             cacheBytes += 2 * n
         }
@@ -283,12 +322,12 @@ public final class Engine: @unchecked Sendable {
         slidingRegions = slidingOffset.sorted { $0.key < $1.key }.map(\.value)
         fullRegions = fullOffset.sorted { $0.key < $1.key }.map(\.value)
 
-        // neuron-major down projections, built on the GPU
-        let perLayer = 96 * 512 * 256 * 4 + 2 * 96 * 8 * 2048 * 2 + 1024 * 256 * 4 + 2 * 16 * 2048 * 2
-        nm = dev.makeBuffer(length: 31 * perLayer, options: .storageModePrivate)!
+        // neuron-major down projections, built on the GPU: a slot for each MoE layer
+        let perLayer = Self.neuronMajorBytes(c)
+        nm = dev.makeBuffer(length: c.moeLayers.count * perLayer, options: .storageModePrivate)!
 
         try buildPlans(slidingOffset: slidingOffset, fullOffset: fullOffset, perLayer: perLayer)
-        try buildNeuronMajor(perLayer: perLayer, source: misc)
+        try buildNeuronMajor(source: misc)
         try buildQueries()
         reset()
         if batchedPrefill { _ = prefiller }   // compile its pipelines now, not in the first prompt
@@ -300,7 +339,7 @@ public final class Engine: @unchecked Sendable {
         position = 0
         known = []
         ringValidFrom = 0
-        ids = [UInt64(Embla.vocab), UInt64(Embla.vocab)]
+        ids = [UInt64(config.vocab), UInt64(config.vocab)]
         memset(hist.contents(), 0, hist.length)
         memset(counter.contents(), 0, counter.length)
         memset(greedy.contents(), 0, 4)
@@ -352,11 +391,11 @@ public final class Engine: @unchecked Sendable {
 
     /// Where `prompt` can resume in the live caches: `livePrefix`, unless the window before it is
     /// gone. Decoding at n reads the sliding layers' and the engram conv's rows of up to
-    /// `Embla.window` positions before it, which must be this sequence's (`ringValidFrom`) and not
+    /// `config.window` positions before it, which must be this sequence's (`ringValidFrom`) and not
     /// yet overwritten by later positions in rings of `ring`.
     func reusablePrefix(_ prompt: [Int], live n: Int) -> Int {
         guard prefixCaching, !noWait else { return 0 }
-        if position - n > Self.ring - Embla.window || max(0, n - Embla.window) < ringValidFrom { return 0 }
+        if position - n > Self.ring - config.window || max(0, n - config.window) < ringValidFrom { return 0 }
         return n
     }
 
@@ -385,7 +424,7 @@ public final class Engine: @unchecked Sendable {
     }
 
     private func mix(n: Int, k: Int, hasX: Bool, norm: Bool, append: Bool, col: Int) throws -> Mix {
-        let p = try ctx.pipeline("mix", source: Self.kernelSource("mix"), macros: [
+        let p = try ctx.pipeline("mix", source: kernel("mix"), macros: [
             "N": n, "K": k, "HAS_X": hasX ? 1 : 0, "NORM": norm ? 1 : 0, "APPEND": append ? 1 : 0,
         ])
         return Mix(pipeline: p, col: Int32(col), k: k)
@@ -393,7 +432,7 @@ public final class Engine: @unchecked Sendable {
 
     /// prep for the columns cols, over n sources (the last one appended from x with `append`).
     private func prep(n: Int, append: Bool, cols: Range<Int>, kout: Int = 0) throws -> (pipe: MTLComputePipelineState, col: Int32, count: Int) {
-        let p = try ctx.pipeline("prep", source: Self.kernelSource("mix"), macros: [
+        let p = try ctx.pipeline("prep", source: kernel("mix"), macros: [
             "N": n, "K": 1, "HAS_X": 0, "NORM": 0, "APPEND": append ? 1 : 0, "KOUT": kout,
         ])
         return (p, Int32(cols.lowerBound), cols.count)
@@ -401,41 +440,76 @@ public final class Engine: @unchecked Sendable {
 
     var queryNames: [String] = []
 
+    /// AttnRes pseudo-query columns: each layer's attention query, the K/V queries of the full layers it
+    /// bridges to and its MLP query, then the engram's and the final mix's.
+    static func queryColumns(_ c: ModelConfig) -> Int {
+        (0 ..< c.layers).reduce(2) { $0 + c.attentionMixes($1) + 1 }
+    }
+
+    /// Slices of 64 rows of a token's MoE (the routed experts' and the shared expert's), a threadgroup each.
+    static func moeSlices(_ c: ModelConfig) -> Int { (c.expertsPerToken * c.expertDim + c.sharedDim) / 64 }
+    var moeSlices: Int { Self.moeSlices(config) }
+
+    /// Bytes of one MoE layer's neuron-major down projections: the routed experts' words, scales and
+    /// biases, then the shared expert's.
+    static func neuronMajorBytes(_ c: ModelConfig) -> Int {
+        let d = c.hidden, e = c.experts, f = c.expertDim, s = c.sharedDim
+        return e * d * f / 2 + 2 * e * (f / 64) * d * 2 + d * s / 2 + 2 * (s / 64) * d * 2
+    }
+
+    /// Whether layer i's q/k/v GEMV reads its input mixes premixed in hs: written by its block's prep
+    /// (at a block start), or by the MoE reduce of the layer before (not after the engram, whose prep
+    /// does not write them).
+    func premixed(_ i: Int) -> Bool {
+        premix && i > 0 && (config.blockStart(i) || (config.mlp[i - 1] == .moe && i - 1 != config.engram.layer))
+    }
+
     private func buildPlans(slidingOffset: [Int: (Int, Int)], fullOffset: [Int: (Int, Int)], perLayer: Int) throws {
-        // pseudo-query columns, in the reference's order
+        let c = config, d = c.hidden, hd = c.headDim
+        // pseudo-query columns, in the reference's order; layerCols[i]: layer i's
         var cols: [String: Int] = [:]
-        for i in 0 ..< Embla.layers {
+        var layerCols: [Range<Int>] = []
+        for i in 0 ..< c.layers {
+            let first = queryNames.count
             cols["attn\(i)"] = queryNames.count
             queryNames.append("transformer.h.\(i).attn_res_query")
-            for j in Embla.bridges[i] ?? [] { queryNames.append("transformer.h.\(j).kv_res_query") }
+            for j in c.bridges[i] ?? [] { queryNames.append("transformer.h.\(j).kv_res_query") }
             cols["mlp\(i)"] = queryNames.count
             queryNames.append("transformer.h.\(i).mlp_res_query")
+            layerCols.append(first ..< queryNames.count)
         }
         cols["engram"] = queryNames.count
         queryNames.append("engram_res_query")
         cols["final"] = queryNames.count
         queryNames.append("final_res_query")
+        precondition(queryNames.count == Self.queryColumns(c))
+        /// The columns from layer i's to the end of its AttnRes block: what a prep at i computes.
+        func blockColumns(from i: Int) -> Range<Int> {
+            let last = min(c.layers, (i / c.resBlock + 1) * c.resBlock) - 1
+            return layerCols[i].lowerBound ..< layerCols[last].upperBound
+        }
+        let moeSlot = Dictionary(uniqueKeysWithValues: c.moeLayers.enumerated().map { ($1, $0) })
+        let gemvSource = try Self.kernelSource("gemv"), moeSource = try Self.kernelSource("moe")
+        let qRows = c.heads * hd, kvRows = c.kvHeads * hd, slidingKVRows = c.slidingKVHeads * hd
 
-        for i in 0 ..< Embla.layers {
-            let kind = Embla.kinds[i], p = "transformer.h.\(i)."
-            let blockStart = i % Embla.blockSize == 0
-            // sources: the embedding, the engram (after layer 0), each completed block
-            let n = i == 0 ? 1 : 2 + i / Embla.blockSize
-            let bridged = Embla.bridges[i] ?? []
-            let attnK = 1 + bridged.count
-            let gemvSource = try Self.kernelSource("gemv")
-            let qkvPipe = premix && i >= 2
+        for i in 0 ..< c.layers {
+            let kind = c.attention[i], p = "transformer.h.\(i)."
+            let blockStart = c.blockStart(i)
+            let n = c.sources(i)
+            let bridged = c.bridges[i] ?? []
+            let attnK = c.attentionMixes(i)
+            let premixed = premixed(i)
+            let qkvPipe = premixed
                 ? try ctx.pipeline("gemv", source: gemvSource, macros: ["EPI": 0, "ROWS": Self.gemvRows])
                 : try ctx.pipeline("gemv", source: gemvSource, macros: [
                     "EPI": 0, "MIX": 1, "K": attnK, "HAS_X": blockStart ? 0 : 1, "ROWS": Self.mixRows])
-            let mlpPipe = i == 0
+            let mlpPipe = c.mlp[i] == .dense
                 ? try ctx.pipeline("gemv", source: gemvSource, macros: ["EPI": 1, "MIX": 1, "K": 1, "HAS_X": 1, "ROWS": Self.mixRows])
-                : try ctx.pipeline("moe_router", source: Self.kernelSource("moe"), macros: ["HAS_X": 1, "RSG": routerRows])
+                : try ctx.pipeline("moe_router", source: moeSource, macros: ["HAS_X": 1, "RSG": routerRows])
             // sources change at each block start (a completed block is appended), and after the
-            // engram (layer 1; prep1, encoded after the engram gate)
-            let premixed = premix && i >= 2
+            // engram (prep1, encoded after the engram gate)
             let blockPrep = blockStart && i > 0
-                ? try prep(n: n, append: true, cols: cols["attn\(i)"]! ..< cols["mlp\(i + 3)"]! + 1, kout: premixed ? attnK : 0) : nil
+                ? try prep(n: n, append: true, cols: blockColumns(from: i), kout: premixed ? attnK : 0) : nil
 
             var end = 0
             var qkvSegs = [try seg(p + "attn.c_q", end: &end, x: 0, y: 0)]
@@ -443,36 +517,38 @@ public final class Engine: @unchecked Sendable {
             var kOff = 0, vOff = 0
             switch kind {
             case .sliding:
-                qkvSegs.append(try seg(p + "attn.c_k", end: &end, x: 0, y: 2048))
-                qkvSegs.append(try seg(p + "attn.c_v", end: &end, x: 0, y: 2560))
+                qkvSegs.append(try seg(p + "attn.c_k", end: &end, x: 0, y: qRows))
+                qkvSegs.append(try seg(p + "attn.c_v", end: &end, x: 0, y: qRows + slidingKVRows))
                 (kOff, vOff) = slidingOffset[i]!
             case .full:
-                if Embla.kvSources[i] == i {
+                if c.kvSources[i] == i {
+                    // its own K/V from its input (mix 0), then each bridged layer's from its mix m
                     for (m, j) in ([i] + bridged).enumerated() {
                         let pj = "transformer.h.\(j)."
-                        let ky = m == 0 ? 2048 : 2560 + (m - 1) * 512
-                        qkvSegs.append(try seg(pj + "attn.c_k", end: &end, x: m * 2048, y: ky))
-                        qkvSegs.append(try seg(pj + "attn.c_v", end: &end, x: m * 2048, y: ky + 256))
+                        let ky = qRows + 2 * kvRows * m
+                        qkvSegs.append(try seg(pj + "attn.c_k", end: &end, x: m * d, y: ky))
+                        qkvSegs.append(try seg(pj + "attn.c_v", end: &end, x: m * d, y: ky + kvRows))
                         let (kc, vc) = fullOffset[j]!
-                        jobs.append(KVJob(k: UInt32(ky), v: UInt32(ky + 256), kc: UInt32(Self.kv8 ? kc : kc / 2), vc: UInt32(Self.kv8 ? vc : vc / 2)))
+                        jobs.append(KVJob(k: UInt32(ky), v: UInt32(ky + kvRows), kc: UInt32(Self.kv8 ? kc : kc / 2), vc: UInt32(Self.kv8 ? vc : vc / 2)))
                     }
                 }
                 (kOff, vOff) = fullOffset[i]!
             case .sparse:
-                (kOff, vOff) = fullOffset[Embla.blockFull(i)]!
+                (kOff, vOff) = fullOffset[c.blockFull(i)!]!
             }
             var oend = 0
             let oproj = [try seg(p + "attn.c_proj", end: &oend, x: 0, y: 0)]
 
             var dense: ([Seg], [Seg])? = nil
             var moe: MoEWeights? = nil
-            if i == 0 {
+            switch c.mlp[i] {
+            case .dense:
                 var e1 = 0, e2 = 0
                 dense = ([try seg(p + "mlp.c_fc", end: &e1, x: 0, y: 0)], [try seg(p + "mlp.c_proj", end: &e2, x: 0, y: 0)])
-            } else {
-                let base = UInt64((i - 1) * perLayer)
-                let pw = base, ps = pw + UInt64(96 * 512 * 256 * 4), pb = ps + UInt64(96 * 8 * 2048 * 2)
-                let spw = pb + UInt64(96 * 8 * 2048 * 2), sps = spw + UInt64(1024 * 256 * 4), spb = sps + UInt64(16 * 2048 * 2)
+            case .moe:
+                let e = c.experts, f = c.expertDim, s = c.sharedDim
+                let pw = UInt64(moeSlot[i]! * perLayer), ps = pw + UInt64(e * d * f / 2), pb = ps + UInt64(e * (f / 64) * d * 2)
+                let spw = pb + UInt64(e * (f / 64) * d * 2), sps = spw + UInt64(d * s / 2), spb = sps + UInt64((s / 64) * d * 2)
                 func off(_ n: String) throws -> UInt64 { UInt64(try t(p + "mlp." + n).offset) }
                 moe = MoEWeights(
                     router: try off("router.weight"), fc_w: try off("experts_fc.weight"), fc_s: try off("experts_fc.scales"), fc_b: try off("experts_fc.biases"),
@@ -490,22 +566,23 @@ public final class Engine: @unchecked Sendable {
         }
         // each MoE layer's reduce: plain, or with the next layer's attention mixes (when that layer
         // is premixed and not a block start, whose prep writes them)
-        for i in 1 ..< Embla.layers {
+        for i in c.moeLayers {
             let next = i + 1
-            if premix && next < Embla.layers && next >= 2 && next % Embla.blockSize != 0 {
+            if next < c.layers && layers[next].premixed && !c.blockStart(next) {
                 let k = layers[next].attnK
-                layers[i].reduce = (try ctx.pipeline("moe_reduce", source: Self.kernelSource("moe"), macros: ["RG": reduceGroups, "MIXK": k]),
+                layers[i].reduce = (try ctx.pipeline("moe_reduce", source: moeSource, macros: ["RG": reduceGroups, "MIXK": k]),
                                     layers[next].attnCol)
             } else {
-                layers[i].reduce = (try ctx.pipeline("moe_reduce", source: Self.kernelSource("moe"), macros: ["RG": reduceGroups]), 0)
+                layers[i].reduce = (try ctx.pipeline("moe_reduce", source: moeSource, macros: ["RG": reduceGroups]), 0)
             }
         }
-        prep0 = try prep(n: 1, append: false, cols: cols["attn0"]! ..< cols["mlp0"]! + 1)
-        prep1 = try prep(n: 2, append: false, cols: cols["attn1"]! ..< cols["mlp3"]! + 1)
-        engramMix = try mix(n: 1, k: 1, hasX: true, norm: false, append: false, col: cols["engram"]!)
-        finalMix = try mix(n: 9, k: 1, hasX: true, norm: true, append: false, col: cols["final"]!)
+        // layer 0's block before the engram (one source), then the rest of it after (the engram appended)
+        prep0 = try prep(n: c.sources(0), append: false, cols: layerCols[0])
+        prep1 = try prep(n: c.sources(1), append: false, cols: blockColumns(from: 1))
+        engramMix = try mix(n: c.sources(0), k: 1, hasX: true, norm: false, append: false, col: cols["engram"]!)
+        finalMix = try mix(n: c.finalSources, k: 1, hasX: true, norm: true, append: false, col: cols["final"]!)
         var end = 0
-        engramSegs = [try seg("engram.w_k", end: &end, x: 0, y: 0), try seg("engram.w_v", end: &end, x: 0, y: 2048)]
+        engramSegs = [try seg("engram.w_k", end: &end, x: 0, y: 0), try seg("engram.w_v", end: &end, x: 0, y: d)]
         end = 0
         lmHead = [try seg("lm_head", end: &end, x: 0, y: 0)]
         let w = try t("transformer.wte.weight"), s = try t("transformer.wte.scales"), b = try t("transformer.wte.biases")
@@ -514,7 +591,7 @@ public final class Engine: @unchecked Sendable {
     }
 
     private func buildQueries() throws {
-        let d = Embla.d
+        let d = config.hidden
         queries = ctx.buffer(Float.self, count: queryNames.count * d)
         let out = queries.contents().assumingMemoryBound(to: Float.self)
         for (q, name) in queryNames.enumerated() {
@@ -523,9 +600,10 @@ public final class Engine: @unchecked Sendable {
         }
     }
 
-    private func buildNeuronMajor(perLayer: Int, source: String) throws {
+    private func buildNeuronMajor(source: String) throws {
+        let c = config, d = c.hidden
         let pT = try ctx.pipeline("nibble_transpose", source: source), p16 = try ctx.pipeline("transpose16", source: source)
-        for i in 1 ..< Embla.layers {
+        for i in c.moeLayers {
             let cb = ctx.queue.makeCommandBuffer()!, enc = cb.makeComputeCommandEncoder()!
             let m = layers[i].moe!
             let p = "transformer.h.\(i).mlp."
@@ -545,12 +623,12 @@ public final class Engine: @unchecked Sendable {
                 enc.setBytes(&rg, length: 8, index: 2)
                 enc.dispatchThreads(MTLSize(width: r, height: g, depth: e), threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1))
             }
-            try words(p + "experts_proj.weight", to: m.pw, e: 96, r: 2048, c: 512)
-            try groups(p + "experts_proj.scales", to: m.ps, e: 96, r: 2048, g: 8)
-            try groups(p + "experts_proj.biases", to: m.pb, e: 96, r: 2048, g: 8)
-            try words(p + "shared_proj.weight", to: m.spw, e: 1, r: 2048, c: 1024)
-            try groups(p + "shared_proj.scales", to: m.sps, e: 1, r: 2048, g: 16)
-            try groups(p + "shared_proj.biases", to: m.spb, e: 1, r: 2048, g: 16)
+            try words(p + "experts_proj.weight", to: m.pw, e: c.experts, r: d, c: c.expertDim)
+            try groups(p + "experts_proj.scales", to: m.ps, e: c.experts, r: d, g: c.expertDim / 64)
+            try groups(p + "experts_proj.biases", to: m.pb, e: c.experts, r: d, g: c.expertDim / 64)
+            try words(p + "shared_proj.weight", to: m.spw, e: 1, r: d, c: c.sharedDim)
+            try groups(p + "shared_proj.scales", to: m.sps, e: 1, r: d, g: c.sharedDim / 64)
+            try groups(p + "shared_proj.biases", to: m.spb, e: 1, r: d, g: c.sharedDim / 64)
             enc.endEncoding()
             cb.commit()
             cb.waitUntilCompleted()
@@ -559,9 +637,9 @@ public final class Engine: @unchecked Sendable {
 
     // ------------------------------------------------------------------ profiling
 
-    /// GPU µs per layer of the fused MoE alone (with `macros` for moe.metal), over the 31 MoE
+    /// GPU µs per layer of the fused MoE alone (with `macros` for moe.metal), over the MoE
     /// layers on the current buffers (run a few steps first). Best of `reps`.
-    /// GPU µs per call of the o projection GEMV chained over the 32 layers (weights from DRAM), and of
+    /// GPU µs per call of the o projection GEMV chained over the layers (weights from DRAM), and of
     /// layer 0's alone (cached after the first call); `macros` for gemv.metal.
     public func timeGEMV(macros: [String: Int], reps: Int = 5) throws -> (dram: Double, cached: Double) {
         let p = try ctx.pipeline("gemv", source: Self.kernelSource("gemv"), macros: macros.merging(["EPI": 0]) { a, _ in a })
@@ -579,7 +657,7 @@ public final class Engine: @unchecked Sendable {
                     segs.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 3) }
                     var n = Int32(1)
                     enc.setBytes(&n, length: 4, index: 4)
-                    enc.dispatchThreadgroups(MTLSize(width: 2048 / rowsPerTG, height: 1, depth: 1),
+                    enc.dispatchThreadgroups(MTLSize(width: config.hidden / rowsPerTG, height: 1, depth: 1),
                                              threadsPerThreadgroup: MTLSize(width: 32 * (macros["NSG"] ?? 8), height: 1, depth: 1))
                     enc.memoryBarrier(scope: .buffers)
                 }
@@ -588,7 +666,7 @@ public final class Engine: @unchecked Sendable {
             }
             return best
         }
-        return (run { self.layers[$0 % 32] }, run { _ in self.layers[0] })
+        return (run { self.layers[$0 % self.layers.count] }, run { _ in self.layers[0] })
     }
 
     // ------------------------------------------------------------------ encoding
@@ -693,8 +771,8 @@ public final class Engine: @unchecked Sendable {
         barrier(enc)
         enc.setComputePipelineState(pCopy)
         enc.setBuffer(hs, offset: 0, index: 0)
-        enc.setBuffer(dbg, offset: debugCount * Embla.d * 2, index: 1)
-        enc.dispatchThreads(MTLSize(width: k * Embla.d, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setBuffer(dbg, offset: debugCount * config.hidden * 2, index: 1)
+        enc.dispatchThreads(MTLSize(width: k * config.hidden, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         debugCount += k
     }
 
@@ -777,7 +855,7 @@ public final class Engine: @unchecked Sendable {
             enc.setBuffer(cache, offset: L.vOffset, index: 4)
             enc.setBuffer(o, offset: 0, index: 5)
             enc.setBytes(&p, length: 4, index: 6)
-            dispatch(enc, "attn", MTLSize(width: 16, height: 1, depth: 1), MTLSize(width: 32 * Self.slidingSG, height: 1, depth: 1))
+            dispatch(enc, "attn", MTLSize(width: config.slidingHeads, height: 1, depth: 1), MTLSize(width: 32 * Self.slidingSG, height: 1, depth: 1))
         case .full, .sparse:
             if !L.kvJobs.isEmpty {
                 enc.label = "kv"
@@ -793,9 +871,9 @@ public final class Engine: @unchecked Sendable {
             }
             // past topk + recent keys, the full layers before sparse ones score every key and select,
             // and the sparse layers attend the selected rows only
-            let keys = pos + 1, selecting = keys > Embla.topk + Embla.recent
-            let scoring = selecting && L.kind == .full && Embla.selects.contains(L.i)
-            let rows = selecting && L.kind == .sparse ? Embla.topk + Embla.recent : keys
+            let keys = pos + 1, selecting = keys > config.sparseTopK + config.sparseRecent
+            let scoring = selecting && L.kind == .full && selects.contains(L.i)
+            let rows = selecting && L.kind == .sparse ? config.sparseTopK + config.sparseRecent : keys
             let short = Self.kv8 && L.kind == .sparse && !selecting && rows <= Self.shortKeys
             let (ch, c) = !Self.kv8 ? chunks(rows) : L.kind == .full ? chunks8(rows) : sparseChunks(rows)
             var ap = AttnParams(S: Int32(rows), CH: Int32(ch), C: Int32(c), maxS: Int32(maxContext), pos: Int32(pos), ng: L.nGains)
@@ -811,10 +889,10 @@ public final class Engine: @unchecked Sendable {
             enc.setBuffer(o, offset: 0, index: 8)
             enc.setBytes(&ap, length: MemoryLayout<AttnParams>.size, index: 9)
             if short {   // a threadgroup per query head (attn_sparse_short)
-                dispatch(enc, "sparse", MTLSize(width: 16, height: 1, depth: 1), MTLSize(width: 512, height: 1, depth: 1))
+                dispatch(enc, "sparse", MTLSize(width: config.heads, height: 1, depth: 1), MTLSize(width: 512, height: 1, depth: 1))
             } else {
                 let threads = Self.kv8 ? 128 : 256
-                dispatch(enc, L.kind == .full ? "full" : "sparse", MTLSize(width: c, height: 2, depth: 1), MTLSize(width: threads, height: 1, depth: 1))
+                dispatch(enc, L.kind == .full ? "full" : "sparse", MTLSize(width: c, height: config.kvHeads, depth: 1), MTLSize(width: threads, height: 1, depth: 1))
             }
             if scoring {
                 barrier(enc)
@@ -823,7 +901,7 @@ public final class Engine: @unchecked Sendable {
                 enc.setBuffer(sel, offset: 0, index: 1)
                 var sm = SIMD2<Int32>(Int32(keys), Int32(maxContext))
                 enc.setBytes(&sm, length: 8, index: 2)
-                dispatch(enc, "select", MTLSize(width: 2, height: 1, depth: 1), MTLSize(width: 1024, height: 1, depth: 1))
+                dispatch(enc, "select", MTLSize(width: config.kvHeads, height: 1, depth: 1), MTLSize(width: 1024, height: 1, depth: 1))
             }
         }
         barrier(enc)
@@ -870,19 +948,19 @@ public final class Engine: @unchecked Sendable {
             enc.setBuffer(route, offset: 0, index: 9)
             var col = L.mlpCol
             enc.setBytes(&col, length: 4, index: 10)
-            dispatch(enc, "router", MTLSize(width: Embla.experts / routerRows, height: 1, depth: 1), MTLSize(width: 32 * routerRows, height: 1, depth: 1))
+            dispatch(enc, "router", MTLSize(width: config.experts / routerRows, height: 1, depth: 1), MTLSize(width: 32 * routerRows, height: 1, depth: 1))
             debugCopy(enc, 1)
             if Self.sharedBeside && !skip.contains("moe") {   // no barrier: beside the router
                 enc.setComputePipelineState(pShared)
                 setMoEBuffers(enc, &mw, col: L.mlpCol)
-                dispatch(enc, "moe", MTLSize(width: Embla.sharedDim / 64, height: 1, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
+                dispatch(enc, "moe", MTLSize(width: config.sharedDim / 64, height: 1, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
             }
             barrier(enc)
         }
         if !skip.contains("moe") {
             enc.setComputePipelineState(pFused)
             setMoEBuffers(enc, &mw, col: L.mlpCol)
-            let slices = Self.sharedBeside ? 8 * Embla.expertDim / 64 : 80
+            let slices = Self.sharedBeside ? config.expertsPerToken * config.expertDim / 64 : moeSlices
             dispatch(enc, "moe", MTLSize(width: slices, height: 1, depth: 1), MTLSize(width: 256, height: 1, depth: 1))
             barrier(enc)
         }
@@ -907,7 +985,7 @@ public final class Engine: @unchecked Sendable {
     private func encodeEngram(_ enc: StepEncoder, pos: Int) {
         if skip.contains("engram") { return }
         encodeMix(enc, engramMix)
-        gemv(enc, engramSegs.map { var s = $0; s.x += UInt32(pos % Self.engramRing * Embla.d); return s }, epi: 0, x: e, y: ekv, part: "engram")
+        gemv(enc, engramSegs.map { var s = $0; s.x += UInt32(pos % Self.engramRing * config.hidden); return s }, epi: 0, x: e, y: ekv, part: "engram")
         barrier(enc)
         enc.label = "engram"
         enc.setComputePipelineState(pGate)
@@ -927,7 +1005,8 @@ public final class Engine: @unchecked Sendable {
     /// need only the token (in `tokens`, written by the CPU for the prompt and by the previous step's
     /// argmax after it), then the rest, which waits for the CPU to signal the engram rows.
     ///
-    /// With `prompt` (a prompt token whose logits nobody reads) the step stops at layer 16's q/k/v:
+    /// With `prompt` (a prompt token whose logits nobody reads) the step stops at the q/k/v of layer
+    /// `config.prefillLayers` (16 in Embla 1):
     /// every key and value the decode half will read projects a mix of layers 0 to 16 (layers 20,
     /// 24 and 28 take theirs from layers 16 and 7), so layers 16 to 31 run only for the last token.
     private func encodeStep(pos: Int, prompt: Bool = false) -> (MTLCommandBuffer, MTLCommandBuffer) {
@@ -957,7 +1036,7 @@ public final class Engine: @unchecked Sendable {
         enc = StepEncoder(rest, serial: Self.serial, profiler: profiler)
         encodeEngram(enc, pos: pos)
         for L in layers.dropFirst() {
-            if prompt && L.i == Embla.prefillLayers {
+            if prompt && L.i == config.prefillLayers {
                 encodeAttention(enc, L, pos: pos, kvOnly: true)
                 enc.endEncoding()
                 endChained(rest)
@@ -974,7 +1053,7 @@ public final class Engine: @unchecked Sendable {
         enc.setComputePipelineState(sampling.isGreedy ? pArgmax : pSample)
         enc.setBuffer(logits, offset: 0, index: 0)
         enc.setBuffer(tokens, offset: 0, index: 1)
-        var v = Int32(Embla.vocab)
+        var v = Int32(config.vocab)
         enc.setBytes(&v, length: 4, index: 2)
         enc.setBuffer(greedy, offset: 4, index: 3)
         var pp = SIMD2<Int32>(Int32(pos), Int32(promptEnd))
@@ -996,7 +1075,7 @@ public final class Engine: @unchecked Sendable {
     /// polls): what the engram rows are read for. The GPU's copy in `tokens`, read before its step
     /// completes, could still hold an old value, and the rows were then another token's.
     var known: [Int] = []
-    private func knownToken(_ q: Int) -> UInt64 { q < 0 ? UInt64(Embla.vocab) : UInt64(known[q]) }
+    private func knownToken(_ q: Int) -> UInt64 { q < 0 ? UInt64(config.vocab) : UInt64(known[q]) }
 
     /// CPU seconds spent reading engram rows, and waiting for steps, in `generate` (profiling).
     public private(set) var engramSeconds = 0.0, waitSeconds = 0.0
@@ -1040,7 +1119,7 @@ public final class Engine: @unchecked Sendable {
             let r0 = Date()
             DispatchQueue.concurrentPerform(iterations: p1 - p0) { j in
                 let q = p0 + j
-                self.table.read(rows: self.table.rows([self.knownToken(q - 2), self.knownToken(q - 1), self.knownToken(q)]), into: e + (k * T + j) * Embla.d)
+                self.table.read(rows: self.table.rows([self.knownToken(q - 2), self.knownToken(q - 1), self.knownToken(q)]), into: e + (k * T + j) * config.hidden)
             }
             prefillRead += Date().timeIntervalSince(r0)
         }
@@ -1089,7 +1168,7 @@ public final class Engine: @unchecked Sendable {
     private func readEngram(_ p: Int) {
         let t0 = DispatchTime.now().uptimeNanoseconds
         defer { engramSeconds += Double(DispatchTime.now().uptimeNanoseconds - t0) * 1e-9 }
-        table.read(rows: table.rows([knownToken(p - 2), knownToken(p - 1), knownToken(p)]), into: e.contents().assumingMemoryBound(to: UInt16.self) + p % Self.engramRing * Embla.d)
+        table.read(rows: table.rows([knownToken(p - 2), knownToken(p - 1), knownToken(p)]), into: e.contents().assumingMemoryBound(to: UInt16.self) + p % Self.engramRing * config.hidden)
         engramReady.signaledValue = engramBase + UInt64(p + 1)
     }
 
@@ -1113,11 +1192,11 @@ public final class Engine: @unchecked Sendable {
     /// Checks the last step's key selection (layer 28's) against a CPU sort: per kv head, distinct
     /// rows, the top-k older keys by score, then the recent ones. Returns a failure, or nil.
     public func verifySelection() -> String? {
-        let keys = position, k = Embla.topk, r = Embla.recent
+        let keys = position, k = config.sparseTopK, r = config.sparseRecent
         guard keys > k + r else { return "context too short to select" }
         let sc = scores.contents().assumingMemoryBound(to: Float.self)
         let ix = sel.contents().assumingMemoryBound(to: UInt32.self)
-        for h in 0 ..< 2 {
+        for h in 0 ..< config.kvHeads {
             let n = keys - r
             let row = (0 ..< k + r).map { Int(ix[h * (k + r) + $0]) }
             if Set(row).count != k + r { return "head \(h): repeated rows" }
@@ -1220,7 +1299,7 @@ public final class Engine: @unchecked Sendable {
         var submitted: [(MTLCommandBuffer, MTLCommandBuffer)] = []
         var wakeTimes = [Double](repeating: 0, count: steps + 1), signalTimes = wakeTimes
         // the prompt: every step submitted as soon as its engram rows are read (the tokens are
-        // known), up to engramRing ahead of the GPU; all but the last stop at layer 16
+        // known), up to engramRing ahead of the GPU; all but the last stop at config.prefillLayers
         let promptStart = Date()
         traceStart = CACurrentMediaTime()
         // positions before `reuse` are in the cache already

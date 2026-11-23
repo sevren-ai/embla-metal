@@ -1,15 +1,15 @@
 // Block Attention Residuals: the K mixes of one sub-layer input.
 // One threadgroup of 1024 threads; each source is read once into registers.
 //
-// N sources in `state` (bf16), K queries from column `col` of `queries` (f32), HAS_X: merge with
+// N sources in `state` (bf16; NSRC slots a token), K queries from column `col` of `queries` (f32), HAS_X: merge with
 // the current block's partial sum x (f32), NORM: RMS-norm the mixes, APPEND: first write bf16(x)
 // to source N - 1 (a block was completed) and read it from there (then HAS_X is 0).
 
 kernel void mix(
-    device bfloat*       state   [[buffer(0)]],   // [tokens][9][D]
+    device bfloat*       state   [[buffer(0)]],   // [tokens][NSRC][D]
     device const float*  queries [[buffer(1)]],
     device const float*  x       [[buffer(2)]],   // [tokens][D]
-    device bfloat*       out     [[buffer(3)]],   // [tokens][3][D]
+    device bfloat*       out     [[buffer(3)]],   // [tokens][NMIX][D]
     constant int&        col     [[buffer(4)]],
     uint tok  [[threadgroup_position_in_grid]],   // prefill: one threadgroup a token
     uint t    [[thread_position_in_threadgroup]],
@@ -18,9 +18,9 @@ kernel void mix(
 {
     constexpr int TG = 1024, E = D / TG, SG = TG / 32;
     constexpr int NP = (N + HAS_X) * (K + 1);
-    state += tok * 9 * D;
+    state += tok * NSRC * D;
     x += tok * D;
-    out += tok * 3 * D;
+    out += tok * NMIX * D;
     threadgroup float buf[SG][NP];
     threadgroup float tot[NP];
 

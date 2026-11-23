@@ -84,7 +84,7 @@ func serve(modelDirectory: URL, name: String, host: String, port: Int, context: 
     let t0 = Date()
     let model = try ChatModel(directory: modelDirectory, context: context)
     print(String(format: "ready in %.1f s, on %@ (context %d tokens)", Date().timeIntervalSince(t0), model.engine.ctx.device.name, context))
-    let server = try Server(model: model, name: name.contains("/") ? String(name.split(separator: "/").last!) : "embla-1", host: host, port: port)
+    let server = try Server(model: model, name: String(name.split(separator: "/").last ?? Substring(name)), host: host, port: port)
     let shown = host == "0.0.0.0" || host == "::" ? "localhost" : host
     let url = "http://\(shown):\(port)"
     server.start { error in

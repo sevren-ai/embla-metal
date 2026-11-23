@@ -5,7 +5,7 @@ import Metal
 /// conversation's next turn, another conversation with the same instructions, a second question
 /// about the same document. `Engine.generate` uses it by itself.
 ///
-/// Sequences are cut into blocks of 128 positions (`Embla.window`). A block is known by its
+/// Sequences are cut into blocks of 128 positions (a multiple of the sliding window, `Engine.check`). A block is known by its
 /// tokens and every token before it, so equal prefixes share their blocks however many sequences
 /// they start. Every stored block keeps the full layers' keys and values of its positions (2.6 KB
 /// a token). Some also keep a checkpoint: the sliding layers' keys and values of its positions
@@ -22,7 +22,7 @@ import Metal
 ///
 /// The least recently used sequences go first once the store is over `limit` bytes.
 final class PrefixCache {
-    static let block = Embla.window
+    static let block = 128
     /// The engram conv's reach back (4 taps dilated by 3), rounded up: rows of it a checkpoint keeps.
     static let histRows = 16
     /// How far before a turn's end its checkpoint is at least: how many tokens before the end of an
@@ -151,16 +151,17 @@ extension Engine {
     /// The full layers' keys and values of positions p0 ..< p0 + 128, per layer, k then v, per
     /// kv head: the rows, then (int8) their scales.
     func fullSpans(_ p0: Int) -> [Span] {
-        let n = PrefixCache.block, row = Self.kv8 ? 128 : 256
+        let n = PrefixCache.block, hd = config.headDim, row = Self.kv8 ? hd : 2 * hd
         var out: [Span] = []
         for (k, v) in fullRegions {
             for base in [k, v] {
-                for h in 0 ..< 2 {
+                for h in 0 ..< config.kvHeads {
                     out.append(Span(buffer: cache, offset: base + (h * maxContext + p0) * row, bytes: n * row))
                 }
                 if Self.kv8 {
-                    out.append(Span(buffer: cache, offset: base + 2 * maxContext * 128 + p0 * 4, bytes: n * 4))
-                    out.append(Span(buffer: cache, offset: base + 2 * maxContext * 128 + (maxContext + p0) * 4, bytes: n * 4))
+                    for h in 0 ..< config.kvHeads {
+                        out.append(Span(buffer: cache, offset: base + config.kvHeads * maxContext * hd + (h * maxContext + p0) * 4, bytes: n * 4))
+                    }
                 }
             }
         }
@@ -171,17 +172,17 @@ extension Engine {
     /// (their ring slots, contiguous: p0 and the ring are multiples of 128) and the engram conv's
     /// inputs of the last `PrefixCache.histRows` of them.
     func windowSpans(_ p0: Int) -> [Span] {
-        let n = PrefixCache.block, slot = p0 % Self.ring
+        let n = PrefixCache.block, slot = p0 % Self.ring, hd = config.headDim
         var out: [Span] = []
         for (k, v) in slidingRegions {
             for base in [k, v] {
-                for h in 0 ..< 4 {
-                    out.append(Span(buffer: cache, offset: base + ((h * Self.ring + slot) * 128) * 2, bytes: n * 128 * 2))
+                for h in 0 ..< config.slidingKVHeads {
+                    out.append(Span(buffer: cache, offset: base + ((h * Self.ring + slot) * hd) * 2, bytes: n * hd * 2))
                 }
             }
         }
         let h0 = (p0 + n - PrefixCache.histRows) % Self.ring
-        out.append(Span(buffer: hist, offset: h0 * Embla.d * 2, bytes: PrefixCache.histRows * Embla.d * 2))
+        out.append(Span(buffer: hist, offset: h0 * config.hidden * 2, bytes: PrefixCache.histRows * config.hidden * 2))
         return out
     }
 

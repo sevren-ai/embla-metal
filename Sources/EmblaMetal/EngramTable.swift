@@ -17,20 +17,20 @@ public final class EngramTable: @unchecked Sendable {
 
     public init(url: URL) throws {
         let fd = open(url.path, O_RDONLY)
-        guard fd >= 0 else { throw EmblaError.badFile(url.path) }
+        guard fd >= 0 else { throw EngineError.badFile(url.path) }
         self.fd = fd
         var n: UInt64 = 0
-        guard pread(fd, &n, 8, 0) == 8 else { throw EmblaError.badFile(url.path) }
+        guard pread(fd, &n, 8, 0) == 8 else { throw EngineError.badFile(url.path) }
         var header = Data(count: Int(n))
         let got = header.withUnsafeMutableBytes { pread(fd, $0.baseAddress, Int(n), 8) }
         guard got == Int(n), let json = try JSONSerialization.jsonObject(with: header) as? [String: Any] else {
-            throw EmblaError.badFile(url.path)
+            throw EngineError.badFile(url.path)
         }
         func offset(_ name: String, _ dtype: String, _ cols: Int) throws -> Int {
             let rows = 2 * Self.pages * Self.rowsPerPage
             guard let t = json[name] as? [String: Any], t["dtype"] as? String == dtype,
                   t["shape"] as? [Int] == [rows, cols], let off = t["data_offsets"] as? [Int] else {
-                throw EmblaError.badFile("\(url.lastPathComponent): \(name)")
+                throw EngineError.badFile("\(url.lastPathComponent): \(name)")
             }
             return 8 + Int(n) + off[0]
         }
