@@ -10,7 +10,7 @@ final class SampleTests: XCTestCase {
     func testDistribution() throws {
         let ctx = try MetalContext()
         let p = try ctx.pipeline("sample", source: Engine.kernelSource("misc"))
-        let V = Embla.vocab, n = 6000
+        let V = 65536, n = 6000   // a vocabulary of Embla 1's size
         // raw logits whose softcapped values are 3.0, 2.7, ... (the tail at -10)
         let capped = (0 ..< V).map { i -> Float in i < 10 ? 3.0 - 0.3 * Float(i) : -10 }
         let raw = capped.map { 15 * atanh($0 / 15) }

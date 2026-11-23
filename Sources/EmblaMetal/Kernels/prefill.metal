@@ -12,7 +12,7 @@ kernel void embed_b(
     device const uchar*  W     [[buffer(0)]],
     constant ulong3&     off   [[buffer(1)]],
     device const uint*   token [[buffer(2)]],
-    device bfloat*       state [[buffer(3)]],   // [T][9][D]
+    device bfloat*       state [[buffer(3)]],   // [T][NSRC][D]
     constant int&        p0    [[buffer(4)]],
     uint2 tg  [[threadgroup_position_in_grid]],
     uint t    [[thread_index_in_threadgroup]],
@@ -30,7 +30,7 @@ kernel void embed_b(
         ss += v[n] * v[n];
     }
     const float r = precise::rsqrt(block_sum<256>(ss, buf, lane, sg) / D + EPS);
-    for (int n = 0; n < 8; n++) state[size_t(tg.y) * 9 * D + t * 8 + n] = bfloat(v[n] * r);
+    for (int n = 0; n < 8; n++) state[size_t(tg.y) * NSRC * D + t * 8 + n] = bfloat(v[n] * r);
 }
 
 // Engram, first half: the gate and g·W_v e (to gated) and its RMS norm (to the history ring at the
@@ -50,7 +50,7 @@ kernel void engram_gate_b(
     threadgroup float buf[32];
     const int tok = int(tg.y), pos = p0 + tok;
     kv += size_t(tok) * 2 * D;
-    he += size_t(tok) * 3 * D;
+    he += size_t(tok) * NMIX * D;
     float key[E2], val[E2], kk = 0.0f, xx = 0.0f, kx = 0.0f;
     for (int e = 0; e < E2; e++) {
         const int d = int(t) + e * TG;
@@ -85,7 +85,7 @@ kernel void engram_conv_b(
     device const bfloat* gated [[buffer(0)]],
     device const bfloat* hist  [[buffer(1)]],
     device const bfloat* convw [[buffer(2)]],   // [D, 4]
-    device bfloat*       state [[buffer(3)]],   // [T][9][D]
+    device bfloat*       state [[buffer(3)]],   // [T][NSRC][D]
     constant int&        p0    [[buffer(4)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -97,7 +97,7 @@ kernel void engram_conv_b(
         conv = conv + v * float(convw[d * 4 + i]);
     }
     const float silu = bf(conv / (1.0f + precise::exp(-conv)));
-    state[size_t(tok) * 9 * D + D + d] = bfloat(float(gated[size_t(tok) * D + d]) + silu);
+    state[size_t(tok) * NSRC * D + D + d] = bfloat(float(gated[size_t(tok) * D + d]) + silu);
 }
 
 // The sliding layers' new keys (normed with the k gains, rotated) and values into the ring. Grid
@@ -292,7 +292,7 @@ kernel void router_b(
 {
     const int row = int(tg.x) * 8 + int(sg), tok = int(tg.y);
     device const bfloat4* wp = (device const bfloat4*)(w + row * D);
-    device const bfloat4* xp = (device const bfloat4*)(x + size_t(tok) * 3 * D);
+    device const bfloat4* xp = (device const bfloat4*)(x + size_t(tok) * NMIX * D);
     float acc = 0.0f;
     for (int i = 0; i < 16; i++) acc += dot(float4(wp[i * 32 + lane]), float4(xp[i * 32 + lane]));
     acc = simd_sum(acc);

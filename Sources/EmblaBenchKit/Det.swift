@@ -18,7 +18,7 @@ func runDet(_ args: [String]) throws {
         return ids.prefix(n).map { t in
             engine.step(t)
             let p = engine.logits.contents().assumingMemoryBound(to: Float.self)
-            return Array(UnsafeBufferPointer(start: p, count: Embla.vocab))
+            return Array(UnsafeBufferPointer(start: p, count: engine.config.vocab))
         }
     }
     let a = run()
