@@ -63,7 +63,10 @@ Prompts on the iPhone run at 4.7-5.1k tokens a second. Sampling costs ~2% agains
 ## How it works
 
 - **Decode:** one pass a token of ~220 dependent dispatches, the next token's work encoded while
-  the current one runs; the CPU reads the next token's engram rows from the SSD in between.
+  the current one runs; the CPU reads the next token's engram rows from the SSD in between. The
+  MoE down projections are read from a neuron-major copy (1.7 GB) on Macs and 12 GB iPhones, and
+  as published on 8 GB iPhones, where the copy and the weights do not fit together; `EMBLA_NM=0`
+  or `1` overrides the choice.
 - **Prefill:** batched, up to 2048 tokens at a time, the matrices as 4-bit GEMMs on the neural
   accelerators (Metal 4 tensor ops) where the GPU has them (M5 and A19 on), simdgroup matrices
   before. `EMBLA_NAX=0` or `1` overrides the detection.
