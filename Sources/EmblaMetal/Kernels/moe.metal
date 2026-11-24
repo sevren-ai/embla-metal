@@ -22,7 +22,14 @@ struct MoEWeights {
     ulong bias;               // expert_bias [E] bf16, in W
     ulong pw, ps, pb;         // routed down, neuron-major, in NM: [E, F, D/8], [E, F/64, D]
     ulong spw, sps, spb;      // shared down, neuron-major: [FS, D/8], [FS/64, D]
+                              // (NMAJOR 0: as published, NM is W: [E, D, F/8], [E, D, F/64]; [D, FS/8], [D, FS/64])
 };
+
+// NMAJOR 1: the down projections neuron-major, a copy the engine builds (Engine.nm). NMAJOR 0: as
+// published, read from W, on iPhones with 8 GB of memory or less (no room for the copy beside W).
+#ifndef NMAJOR
+#define NMAJOR 1
+#endif
 
 // The router logits (bf16 weights, f32 sums), a simdgroup a row; the last threadgroup routes: top-8
 // of sigmoid(logit) + bias, the chosen sigmoids renormalized as gates (rounded to bf16).
@@ -146,24 +153,42 @@ kernel void moe_fused(
     device const uint* uw; device const bfloat* us; device const bfloat* ub;
     device const uint* dw; device const bfloat* ds; device const bfloat* db;
     float gain;
+#if !NMAJOR
+    int dn;   // neurons in a row of the published down projection (F or FS)
+#endif
     if (routed) {
         const int ei = int(s) / (F / SL), r0 = (int(s) % (F / SL)) * SL;
         const size_t e = route[ei], row = e * F + r0;
         uw = (device const uint*)(W + mw.fc_w) + row * KW;
         us = (device const bfloat*)(W + mw.fc_s) + row * (D / 64);
         ub = (device const bfloat*)(W + mw.fc_b) + row * (D / 64);
+#if NMAJOR
         dw = (device const uint*)(NM + mw.pw) + row * KW;
         ds = (device const bfloat*)(NM + mw.ps) + (e * (F / 64) + r0 / 64) * D;
         db = (device const bfloat*)(NM + mw.pb) + (e * (F / 64) + r0 / 64) * D;
+#else
+        // expert e's D rows, from this slice's neurons (one group of 64)
+        dw = (device const uint*)(NM + mw.pw) + e * D * (F / 8) + r0 / 8;
+        ds = (device const bfloat*)(NM + mw.ps) + e * D * (F / 64) + r0 / 64;
+        db = (device const bfloat*)(NM + mw.pb) + e * D * (F / 64) + r0 / 64;
+        dn = F;
+#endif
         gain = as_type<float>(route[TOPK + ei]);
     } else {
         const int r0 = (int(s) - RSLICE) * SL;
         uw = (device const uint*)(W + mw.sh_w) + size_t(r0) * KW;
         us = (device const bfloat*)(W + mw.sh_s) + size_t(r0) * (D / 64);
         ub = (device const bfloat*)(W + mw.sh_b) + size_t(r0) * (D / 64);
+#if NMAJOR
         dw = (device const uint*)(NM + mw.spw) + size_t(r0) * KW;
         ds = (device const bfloat*)(NM + mw.sps) + size_t(r0 / 64) * D;
         db = (device const bfloat*)(NM + mw.spb) + size_t(r0 / 64) * D;
+#else
+        dw = (device const uint*)(NM + mw.spw) + r0 / 8;
+        ds = (device const bfloat*)(NM + mw.sps) + r0 / 64;
+        db = (device const bfloat*)(NM + mw.spb) + r0 / 64;
+        dn = FS;
+#endif
         gain = 1.0f;
     }
 
@@ -184,8 +209,10 @@ kernel void moe_fused(
             }
         }
     }
+#if NMAJOR
     const float4 s0 = float4(*(device const bfloat4*)(ds + 8 * tid)), s1 = float4(*(device const bfloat4*)(ds + 8 * tid + 4));
     const float4 c0 = float4(*(device const bfloat4*)(db + 8 * tid)), c1 = float4(*(device const bfloat4*)(db + 8 * tid + 4));
+#endif
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ---- the live neurons, compacted by simdgroup 0
@@ -199,9 +226,28 @@ kernel void moe_fused(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ---- sparse down: thread tid owns word tid (outputs 8·tid ..), UNR live neurons in flight
     const int n = nlive;
     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0}, hsum = 0.0f;
+#if !NMAJOR
+    // ---- down as published: thread tid owns outputs 8·tid .. (rows of dn / 8 words), the live
+    // neurons in the order the sparse loop below takes them, then each row's group scale and bias.
+    // Slower than neuron-major (each row's scale and bias is its own load): 236 against 311 tok/s
+    // on the M5 Pro.
+    float sc[8], bs[8];
+    for (int k = 0; k < 8; k++) {
+        const size_t row = 8 * tid + k;
+        device const uint* q = dw + row * (dn / 8);
+        for (int j = 0; j < n; j++) {
+            const int i = int(live[j]);
+            const float h = hs[i];
+            if (k == 0) hsum += h;
+            acc[k] += h * float((q[i / 8] >> (4 * (i % 8))) & 0xFu);
+        }
+        sc[k] = float(ds[row * (dn / 64)]);
+        bs[k] = float(db[row * (dn / 64)]);
+    }
+#else
+    // ---- sparse down: thread tid owns word tid (outputs 8·tid ..), UNR live neurons in flight
     for (int j0 = 0; j0 < n; j0 += UNR) {
         uint qw[UNR];
         float hv[UNR];
@@ -220,6 +266,7 @@ kernel void moe_fused(
     }
     const float sc[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
     const float bs[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+#endif
     device float4* op = (device float4*)(part + size_t(s) * D + 8 * tid);
     float o[8];
     for (int k = 0; k < 8; k++) o[k] = n == 0 ? 0.0f : gain * (sc[k] * acc[k] + bs[k] * hsum);

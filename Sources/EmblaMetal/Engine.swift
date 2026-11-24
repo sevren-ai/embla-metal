@@ -35,7 +35,17 @@ public final class Engine: @unchecked Sendable {
     public let maxContext: Int
     public internal(set) var position = 0
 
-    let W: MTLBuffer, nm: MTLBuffer
+    let W: MTLBuffer
+    /// The MoE down projections neuron-major (moe_fused's sparse down reads a live neuron's row in
+    /// one load), or nil on an iPhone with 8 GB of memory or less (`neuronMajorMemory`): a decode
+    /// step binds both this copy (1.7 GB for Embla 1) and W, and on an 8 GB iPhone (5.3 GB GPU
+    /// working set) every step's command buffer then failed with
+    /// kIOGPUCommandBufferCallbackErrorOutOfMemory. moe_fused (NMAJOR 0) reads them from W as
+    /// published instead. EMBLA_NM=0 or 1 overrides it.
+    let nm: MTLBuffer?
+    /// The memory above which an iPhone gets `nm`: more than 8 GB (12 GB iPhones). An iPhone's
+    /// physicalMemory is a little under its nominal size. Macs always build it.
+    static let neuronMajorMemory: UInt64 = 8 << 30
     let state, x, hs, qkv, o, hmlp, rlogits, route, part, apart, counter, scores, sel: MTLBuffer
     let e, ekv, hist, cache, tokens, greedy, m0, stats: MTLBuffer
     /// Learn each step's token by polling the word the argmax writes for the CPU (greedy[-1]), which
@@ -265,8 +275,6 @@ public final class Engine: @unchecked Sendable {
         pSparseShort = try ctx.pipeline("attn_sparse_short", source: attn, macros: ["SCORES": 0, "SEL": 0])
         pSparseSel = try ctx.pipeline(sparseName, source: attn, macros: ["SCORES": 0, "SEL": 1])
         pSelect = try ctx.pipeline("select_keys", source: attn, macros: ["SCORES": 0, "SEL": 0])
-        pFused = try ctx.pipeline("moe_fused", source: moe, macros: Self.envMacros("EMBLA_FUSED").merging(["PART": Self.sharedBeside ? 1 : 0]) { a, _ in a })
-        pShared = try ctx.pipeline("moe_fused", source: moe, macros: Self.envMacros("EMBLA_FUSED").merging(["PART": 2]) { a, _ in a })
         pReduce = try ctx.pipeline("moe_reduce", source: moe, macros: ["RG": 1])
         dots = buf(64 * 8 * 4)
         pEmbed = try ctx.pipeline("embed", source: misc)
@@ -322,12 +330,29 @@ public final class Engine: @unchecked Sendable {
         slidingRegions = slidingOffset.sorted { $0.key < $1.key }.map(\.value)
         fullRegions = fullOffset.sorted { $0.key < $1.key }.map(\.value)
 
-        // neuron-major down projections, built on the GPU: a slot for each MoE layer
+        // neuron-major down projections, built on the GPU: a slot for each MoE layer, on Macs and on
+        // iPhones with more than 8 GB (a decode step binds them beside the weights)
         let perLayer = Self.neuronMajorBytes(c)
-        nm = dev.makeBuffer(length: c.moeLayers.count * perLayer, options: .storageModePrivate)!
+        let nmBytes = c.moeLayers.count * perLayer
+        #if os(macOS)
+        let roomy = true
+        #else
+        let roomy = ProcessInfo.processInfo.physicalMemory > Self.neuronMajorMemory
+        #endif
+        switch ProcessInfo.processInfo.environment["EMBLA_NM"] {
+        case "0": nm = nil
+        case "1": nm = dev.makeBuffer(length: nmBytes, options: .storageModePrivate)!
+        default: nm = roomy && nmBytes > 0 ? dev.makeBuffer(length: nmBytes, options: .storageModePrivate) : nil
+        }
+        let fused = Self.envMacros("EMBLA_FUSED").merging(["NMAJOR": nm != nil ? 1 : 0]) { a, _ in a }
+        pFused = try ctx.pipeline("moe_fused", source: moe, macros: fused.merging(["PART": Self.sharedBeside ? 1 : 0]) { a, _ in a })
+        pShared = try ctx.pipeline("moe_fused", source: moe, macros: fused.merging(["PART": 2]) { a, _ in a })
 
         try buildPlans(slidingOffset: slidingOffset, fullOffset: fullOffset, perLayer: perLayer)
         try buildNeuronMajor(source: misc)
+        if ProcessInfo.processInfo.environment["EMBLA_VERBOSE"] != nil {
+            print("decode: MoE down projections \(nm != nil ? "neuron-major" : "as published")")
+        }
         try buildQueries()
         reset()
         if batchedPrefill { _ = prefiller }   // compile its pipelines now, not in the first prompt
@@ -547,9 +572,14 @@ public final class Engine: @unchecked Sendable {
                 dense = ([try seg(p + "mlp.c_fc", end: &e1, x: 0, y: 0)], [try seg(p + "mlp.c_proj", end: &e2, x: 0, y: 0)])
             case .moe:
                 let e = c.experts, f = c.expertDim, s = c.sharedDim
-                let pw = UInt64(moeSlot[i]! * perLayer), ps = pw + UInt64(e * d * f / 2), pb = ps + UInt64(e * (f / 64) * d * 2)
-                let spw = pb + UInt64(e * (f / 64) * d * 2), sps = spw + UInt64(d * s / 2), spb = sps + UInt64((s / 64) * d * 2)
                 func off(_ n: String) throws -> UInt64 { UInt64(try t(p + "mlp." + n).offset) }
+                // the down projections: this layer's slot in nm, or as published in W
+                var pw = UInt64(moeSlot[i]! * perLayer), ps = pw + UInt64(e * d * f / 2), pb = ps + UInt64(e * (f / 64) * d * 2)
+                var spw = pb + UInt64(e * (f / 64) * d * 2), sps = spw + UInt64(d * s / 2), spb = sps + UInt64((s / 64) * d * 2)
+                if nm == nil {
+                    (pw, ps, pb) = (try off("experts_proj.weight"), try off("experts_proj.scales"), try off("experts_proj.biases"))
+                    (spw, sps, spb) = (try off("shared_proj.weight"), try off("shared_proj.scales"), try off("shared_proj.biases"))
+                }
                 moe = MoEWeights(
                     router: try off("router.weight"), fc_w: try off("experts_fc.weight"), fc_s: try off("experts_fc.scales"), fc_b: try off("experts_fc.biases"),
                     sh_w: try off("shared_fc.weight"), sh_s: try off("shared_fc.scales"), sh_b: try off("shared_fc.biases"),
@@ -601,6 +631,7 @@ public final class Engine: @unchecked Sendable {
     }
 
     private func buildNeuronMajor(source: String) throws {
+        guard let nm else { return }
         let c = config, d = c.hidden
         let pT = try ctx.pipeline("nibble_transpose", source: source), p16 = try ctx.pipeline("transpose16", source: source)
         for i in c.moeLayers {
@@ -911,7 +942,7 @@ public final class Engine: @unchecked Sendable {
 
     private func setMoEBuffers(_ enc: StepEncoder, _ mw: inout MoEWeights, col: Int32) {
         enc.setBuffer(W, offset: 0, index: 0)
-        enc.setBuffer(nm, offset: 0, index: 1)
+        enc.setBuffer(nm ?? W, offset: 0, index: 1)   // the down projections (MoEWeights.pw ..)
         enc.setBuffer(hs, offset: 0, index: 2)
         enc.setBuffer(route, offset: 0, index: 3)
         enc.setBuffer(part, offset: 0, index: 4)
@@ -1175,7 +1206,8 @@ public final class Engine: @unchecked Sendable {
     /// Waits for step p's token: polls the word its argmax writes for the CPU, or waits for the
     /// command buffer.
     /// Returns the step's token: from the polled word, which carries it ((pos + 1) << 16 | token),
-    /// or from `tokens` once the step has completed.
+    /// or from `tokens` once the step has completed. A step whose command buffer failed stops
+    /// here, as a failed prefill does: its token would be whatever `tokens` held (0), not an answer.
     private func awaitStep(_ p: Int, _ cb: MTLCommandBuffer) -> Int {
         if poll {
             let done = UnsafeMutableRawPointer(greedy.contents()).assumingMemoryBound(to: UInt32.self)
@@ -1186,6 +1218,7 @@ public final class Engine: @unchecked Sendable {
             }
         }
         cb.waitUntilCompleted()
+        if let err = cb.error { fatalError("step \(p) failed: \(err)") }
         return token(at: p + 1)
     }
 
