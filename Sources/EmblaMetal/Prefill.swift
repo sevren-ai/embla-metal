@@ -25,6 +25,29 @@ final class Prefill {
     static let expertRows = Engine.envMacros("EMBLA_PREFILL")["EXPERT_ROWS"] ?? 64
     var threads: Int { nax ? 128 : 256 }
     static let chunk = Engine.envMacros("EMBLA_PREFILL")["CHUNK"] ?? 2048
+    /// Layers a command buffer takes in a chunk (EMBLA_PREFILL=LAYERS=n, 0 for the whole chunk in
+    /// one). iOS restarts the GPU ("progress timeout") when a command buffer runs for seconds, as an
+    /// A17 Pro's whole chunk does at 4k, so on iOS a layer a command buffer. No cost on a Mac either.
+    #if os(iOS)
+    static let layersPerBuffer = Engine.envMacros("EMBLA_PREFILL")["LAYERS"] ?? 1
+    #else
+    static let layersPerBuffer = Engine.envMacros("EMBLA_PREFILL")["LAYERS"] ?? 0
+    #endif
+    /// Query tokens a full attention dispatch takes on GPUs without neural accelerators (attn_full_b;
+    /// EMBLA_PREFILL=ATTN_TOKENS=n), one after the other: their partial sums are 33 KB a token, 270
+    /// MB for a whole chunk, wired memory that an 8 GB iPhone runs out of at long contexts (the app
+    /// killed for vm-pageshortage at 64k on the A18 Pro).
+    static let attnTokens = Engine.envMacros("EMBLA_PREFILL")["ATTN_TOKENS"] ?? 128
+    /// That attention in command buffers of at most this many query-key pairs (EMBLA_PREFILL=
+    /// ATTN_PAIRS=n, 0 for no limit): its time grows with the context, 3.6 s for a chunk at 32k on
+    /// the A18 Pro, about 54 ns a pair. 4M pairs: ~0.2 s on the A18 Pro, ~0.7 s on the A17 Pro.
+    #if os(iOS)
+    static let attnPairs = Engine.envMacros("EMBLA_PREFILL")["ATTN_PAIRS"] ?? 1 << 22
+    #else
+    static let attnPairs = Engine.envMacros("EMBLA_PREFILL")["ATTN_PAIRS"] ?? 0
+    #endif
+    /// The command buffers `encode` committed itself (a chunk's earlier parts), since the prefill began.
+    var committed: [MTLCommandBuffer] = []
     /// The sliding layers' attention on simdgroup matrices, a kv head and two tokens a threadgroup
     /// (attn_sliding8_b), not a query head and token a threadgroup: a 1024-token prompt 245 -> 225 ms
     /// on the iPhone 18 Pro, 109 -> 102 ms on the M5 Pro (16k: 1530 -> 1400 ms); against the reference
@@ -146,7 +169,7 @@ final class Prefill {
                 if ProcessInfo.processInfo.environment["EMBLA_VERBOSE"] != nil { print("attn_nax: \(error)") }
             }
         }
-        if pAttnNax == nil { part = buf(T * 16 * c.heads * (hd + 1) * 4) }
+        if pAttnNax == nil { part = buf(min(T, Self.attnTokens) * 16 * c.heads * (hd + 1) * 4) }
         if ProcessInfo.processInfo.environment["EMBLA_VERBOSE"] != nil {
             print("prefill: GEMM on \(nax ? "neural accelerators" : "simdgroup matrices"), full attention \(pAttnNax != nil ? "on neural accelerators" : "a key at a time")")
         }
@@ -270,6 +293,15 @@ final class Prefill {
         var cb = E.chainedCommandBuffer()
         var enc = cb.makeComputeCommandEncoder(dispatchType: .concurrent)!
         var pos0 = Int32(p0)
+        // commits what is encoded and goes on in a new command buffer, after it on the GPU
+        func split() {
+            enc.endEncoding()
+            E.endChained(cb)
+            cb.commit()
+            committed.append(cb)
+            cb = E.chainedCommandBuffer()
+            enc = cb.makeComputeCommandEncoder(dispatchType: .concurrent)!
+        }
 
         enc.setComputePipelineState(pEmbed)
         enc.setBuffer(E.W, offset: 0, index: 0)
@@ -327,19 +359,30 @@ final class Prefill {
                     encodeFullNAX(enc, L, nax, p0: p0, tokens: T)
                     break
                 }
+                // the queries attnTokens at a time, one after the other in the same partial sums, a
+                // new command buffer once attnPairs query-key pairs are in this one; the keys in the
+                // same blocks for every slice: the same sums as in one dispatch
                 let keys = p0 + T, ch = max(64, (keys + 15) / 16 + 63) / 64 * 64, c = (keys + ch - 1) / ch
-                var ap = SIMD4<Int32>(pos0, Int32(ch), Int32(c), Int32(E.maxContext))
-                enc.setComputePipelineState(pFull)
-                enc.setBuffer(qkv, offset: 0, index: 0)
-                enc.setBuffer(E.W, offset: L.qGain, index: 1)
-                enc.setBuffer(E.W, offset: L.kGain, index: 2)
-                enc.setBuffer(E.cache, offset: L.kOffset, index: 3)
-                enc.setBuffer(E.cache, offset: L.vOffset, index: 4)
-                enc.setBuffer(part, offset: 0, index: 5)
-                enc.setBuffer(counter, offset: 0, index: 6)
-                enc.setBuffer(o, offset: 0, index: 7)
-                enc.setBytes(&ap, length: 16, index: 8)
-                dispatch(enc, "attn", MTLSize(width: c, height: 2, depth: T), MTLSize(width: 256, height: 1, depth: 1))
+                var pairs = 0
+                for t0 in stride(from: 0, to: T, by: Self.attnTokens) {
+                    let n = min(Self.attnTokens, T - t0)
+                    if t0 > 0 {
+                        if Self.attnPairs > 0 && pairs + n * keys > Self.attnPairs { split(); pairs = 0 } else { barrier(enc) }
+                    }
+                    pairs += n * keys
+                    var ap = SIMD4<Int32>(pos0 + Int32(t0), Int32(ch), Int32(c), Int32(E.maxContext))
+                    enc.setComputePipelineState(pFull)
+                    enc.setBuffer(qkv, offset: t0 * Engine.qkvWidth * 2, index: 0)
+                    enc.setBuffer(E.W, offset: L.qGain, index: 1)
+                    enc.setBuffer(E.W, offset: L.kGain, index: 2)
+                    enc.setBuffer(E.cache, offset: L.kOffset, index: 3)
+                    enc.setBuffer(E.cache, offset: L.vOffset, index: 4)
+                    enc.setBuffer(part, offset: 0, index: 5)
+                    enc.setBuffer(counter, offset: 0, index: 6)
+                    enc.setBuffer(o, offset: t0 * d * 2, index: 7)
+                    enc.setBytes(&ap, length: 16, index: 8)
+                    dispatch(enc, "attn", MTLSize(width: c, height: 2, depth: n), MTLSize(width: 256, height: 1, depth: 1))
+                }
             }
             barrier(enc)
             let os = L.oproj[0]
@@ -362,12 +405,15 @@ final class Prefill {
                     enc.endEncoding()
                     E.endChained(cb)
                     cb.commit()
+                    committed.append(cb)
                     E.mark("layer 0 committed")
                     cb = E.chainedCommandBuffer()
                     cb.encodeWaitForEvent(event, value: value)
                     enc = cb.makeComputeCommandEncoder(dispatchType: .concurrent)!
                 }
                 encodeEngram(enc, tokens: T, pos0: &pos0)
+            } else if Self.layersPerBuffer > 0 && (i + 1) % Self.layersPerBuffer == 0 {
+                split()
             }
         }
         enc.endEncoding()

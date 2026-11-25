@@ -9,7 +9,10 @@ public final class MetalContext: @unchecked Sendable {
     private var libraries: [String: MTLLibrary] = [:]
 
     public init() throws {
-        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
+        // more command buffers in flight than the default 64: a prefill chunk commits one a layer
+        // and its attention's slices (Prefill.layersPerBuffer), most waiting for its engram rows,
+        // which the CPU reads only once the chunk is encoded
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(maxCommandBufferCount: 1024) else {
             throw EngineError.noMetal
         }
         self.device = device
