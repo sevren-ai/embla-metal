@@ -1144,6 +1144,7 @@ public final class Engine: @unchecked Sendable {
         let pf = prefiller, T = Prefill.chunk
         prefillGPU = 0
         prefillRead = 0
+        pf.committed = []
         nonisolated(unsafe) let e = pf.e.contents().assumingMemoryBound(to: UInt16.self)
         // the engram rows of positions p0 ..< p1 into half k of e
         func read(_ p0: Int, _ k: Int, _ p1: Int) {
@@ -1175,16 +1176,17 @@ public final class Engine: @unchecked Sendable {
     /// Waits for the prefill's command buffers; `prefillGPU` is their GPU time (the GPU's wait for
     /// the engram rows included).
     func finishPrefill(_ cbs: [MTLCommandBuffer]) {
-        for cb in cbs {
-            cb.waitUntilCompleted()
+        for cb in cbs { cb.waitUntilCompleted() }
+        let all = (prefiller.committed + cbs).sorted { $0.gpuStartTime < $1.gpuStartTime }
+        for cb in all {
             if let err = cb.error { fatalError("prefill failed: \(err)") }
         }
         if trace, let t0 = traceStart {
-            for (i, cb) in cbs.enumerated() {
-                print(String(format: "trace: prefill cb %d GPU %.2f .. %.2f ms", i, (cb.gpuStartTime - t0) * 1e3, (cb.gpuEndTime - t0) * 1e3))
+            for (i, cb) in all.enumerated() {
+                print(String(format: "trace: prefill cb %d GPU %.2f .. %.2f ms (%.1f ms)", i, (cb.gpuStartTime - t0) * 1e3, (cb.gpuEndTime - t0) * 1e3, (cb.gpuEndTime - cb.gpuStartTime) * 1e3))
             }
         }
-        if let a = cbs.first, let b = cbs.last { prefillGPU = b.gpuEndTime - a.gpuStartTime }
+        if let a = all.first, let b = all.last { prefillGPU = b.gpuEndTime - a.gpuStartTime }
     }
 
     /// Run every prompt token through the whole model (EMBLA_FULL_PROMPT=1; for comparison).
